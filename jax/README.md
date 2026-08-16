@@ -24,8 +24,8 @@ Please install the Google Cloud CLI following the [official instructions](https:
 It is needed for interacting with the Google Cloud buckets for storage (*e.g.*, via `gsutil`) and for requesting and running commands on TPUs.
 
 ### 1.1.2 Data
-Please make sure that you've followed the [data processing guide](../data_processing) and uploaded the TFRecords to a Google Cloud bucket.
-After uploading, please update the data path to each dataset in the config files under [configs](configs).
+Please make sure you have either downloaded [our processed TFRecords](https://huggingface.co/i1-datasets) or followed the [data processing guide](../data_processing) to create the TFRecords.
+Then, please upload the TFRecords to a Google Cloud bucket and update the data path to each dataset in the config files under [configs](configs).
 
 ```python
 path_and_count = [
@@ -136,7 +136,7 @@ bash kill.sh
 ## 2.1 Prerequisites
 
 ### 2.1.1 Data
-Please make sure that you've followed the [data processing guide](../data_processing) to create the TFRecords. After that, please update the data path to each dataset in the config files under [configs](configs).
+Please make sure you have either downloaded [our processed TFRecords](https://huggingface.co/i1-datasets) or followed the [data processing guide](../data_processing) to create the TFRecords. After that, please update the data path to each dataset in the config files under [configs](configs).
 
 ```python
 path_and_count = [

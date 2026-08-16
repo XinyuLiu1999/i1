@@ -57,7 +57,7 @@ The evaluation results for the trained checkpoint following this setup are as fo
 ## 3. Training with the i1 Recipe
 
 ### 3.1 Prepare the Data
-Please make sure that you've followed the [data processing guide](../data_processing) to create the TFRecords. After that, please update the data path to each dataset in the config files under [configs](configs).
+Please make sure you have either downloaded [our processed TFRecords](https://huggingface.co/i1-datasets) or followed the [data processing guide](../data_processing) to create the TFRecords. After that, please update the data path to each dataset in the config files under [configs](configs).
 
 ```python
 path_and_count = [

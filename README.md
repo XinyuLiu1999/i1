@@ -38,7 +38,7 @@ We **fully open-source** the training code, data, and recipes for **reproducing*
  - [x] Intermediate 256- and 512-Resolution Checkpoints \[[3B](https://huggingface.co/zlab-princeton/i1-3B/tree/main)\] \[[1B](https://huggingface.co/zlab-princeton/i1-1B/tree/main)\]
  - [x] [JAX Training and Inference Code for TPUs and GPUs](jax)
  - [x] PyTorch [Training](torch_train) and [Inference](torch_inference) Code for GPUs
- - [x] [Dataset](https://huggingface.co/datasets/zlab-princeton/i1-captions) and [Data Pipelines](data_processing)
+ - [x] Dataset ([Captions](https://huggingface.co/datasets/zlab-princeton/i1-captions) and [Image-Caption TFRecords](https://huggingface.co/i1-datasets)) and [Data Pipelines](data_processing)
  - [x] [Benchmark Evaluation Pipeline](benchmark_eval)
  - [ ] Multi-Aspect-Ratio Checkpoint, Data Pipelines, and Training Code
 

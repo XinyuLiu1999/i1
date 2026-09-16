@@ -13,7 +13,9 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "torch_train"))
 from models.dit import DualStreamDiTConfig, i1DiT
-from datasets.bucketed import BucketedImages, BucketBatchSampler, build_bucket_iterator
+from datasets.bucketed import BucketedImages, BucketBatchSampler, bucket_steps_per_epoch, build_bucket_iterator
+from datasets.data_sources import iter_image_records, open_record_image
+from datasets.validate_images import _validate_shard
 from datasets.captions import tokenize_captions
 from training.checkpoint import load_model_weights, load_train_states, resolve_resume_path, save_checkpoint
 from training.parallel import DistInfo, load_tp_batch
@@ -174,6 +176,42 @@ class GeometryTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_1024_sft_defaults_to_one_epoch(self):
+        from configs.sft_1024 import get_config
+        config = get_config()
+        self.assertEqual(config.num_epochs, 1)
+        self.assertIsNone(config.total_steps)
+
+    def test_gpt_image_parquet_source(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            from io import BytesIO
+            buffer = BytesIO()
+            Image.new("RGB", (96, 64), (12, 34, 56)).save(buffer, format="PNG")
+            table = pa.table(dict(id=["sample"], prompt=["caption"], size=["96x64"],
+                                  image_bytes=[buffer.getvalue()]))
+            path = root / "sample.parquet"
+            pq.write_table(table, path, row_group_size=1)
+            records = list(iter_image_records(path))
+            self.assertEqual((records[0].width, records[0].height), (96, 64))
+            self.assertEqual(open_record_image(records[0]).size, (96, 64))
+            validation = _validate_shard(path, 10)
+            self.assertEqual((validation["checked"], validation["decoded"],
+                              validation["decode_error_count"],
+                              validation["dimension_mismatch_count"]), (1, 1, 0, 0))
+            for shard in range(2, 6):
+                pq.write_table(table, root / f"sample_{shard}.parquet", row_group_size=1)
+            self.assertEqual(len(list(iter_image_records(root))), 5)
+            config = dict(manifest=str(path), buckets=[(32, 48)], batch_size=1, num_workers=0)
+            dataset = BucketedImages(config)
+            pixels, caption = dataset[0]
+            self.assertEqual((pixels.shape, caption), (torch.Size([32, 48, 3]), "caption"))
+
     def test_rank_shapes_disjoint_samples_and_resume(self):
         groups = [list(range(100)), list(range(100, 200)), []]
         samplers = [list(BucketBatchSampler(groups, 8, rank, 2, 12, seed=4)) for rank in range(2)]
@@ -182,6 +220,55 @@ class DataTests(unittest.TestCase):
             self.assertEqual(len(set(a + b)), 8)
         resumed = list(BucketBatchSampler(groups, 8, 0, 2, 12, start_step=5, seed=4))
         self.assertEqual(resumed, samplers[0][5:])
+
+    def test_epoch_sampler_exhausts_buckets_and_pads_only_tails(self):
+        groups = [list(range(10)), list(range(100, 105)), []]
+        sampler = BucketBatchSampler(groups, 4, 0, 1, 10, seed=7)
+        batches = list(sampler)
+        self.assertEqual(bucket_steps_per_epoch(groups, 4), 5)
+        self.assertEqual(sampler.steps_per_epoch, 5)
+        for epoch in range(2):
+            epoch_batches = batches[epoch * 5:(epoch + 1) * 5]
+            self.assertTrue(all(all(index < 100 for index in batch) or
+                                all(index >= 100 for index in batch)
+                                for batch in epoch_batches))
+            seen = {index for batch in epoch_batches for index in batch}
+            self.assertTrue(set(range(10)).issubset(seen))
+            self.assertTrue(set(range(100, 105)).issubset(seen))
+            self.assertEqual(sum(map(len, epoch_batches)), 20)
+
+        resumed = list(BucketBatchSampler(groups, 4, 0, 1, 10, start_step=5, seed=7))
+        self.assertEqual(resumed, batches[5:])
+
+    def test_distributed_sampler_small_buckets_and_every_resume_offset(self):
+        groups = [[], list(range(3)), list(range(10, 18)),
+                  list(range(20, 29)), list(range(40, 57))]
+        steps_per_epoch = bucket_steps_per_epoch(groups, 8)
+        total_steps = steps_per_epoch * 3
+        for seed in (0, 7, 42):
+            full = list(BucketBatchSampler(groups, 8, 0, 1, total_steps, seed=seed))
+            for epoch in range(3):
+                batches = full[epoch * steps_per_epoch:(epoch + 1) * steps_per_epoch]
+                for group in groups[1:]:
+                    matching = [batch for batch in batches if batch[0] in group]
+                    self.assertEqual(len(matching), (len(group) + 7) // 8)
+                    self.assertEqual({item for batch in matching for item in batch}, set(group))
+                    for batch in matching:
+                        self.assertEqual(len(batch), 8)
+                        self.assertTrue(set(batch).issubset(group))
+                        if len(group) >= 8:
+                            self.assertEqual(len(set(batch)), 8)
+            for world in (1, 2, 4, 8):
+                ranks = [list(BucketBatchSampler(groups, 8, rank, world, total_steps, seed=seed))
+                         for rank in range(world)]
+                combined = [[item for rank in ranks for item in rank[step]] for step in range(total_steps)]
+                self.assertEqual(combined, full)
+                for rank in range(world):
+                    for start in range(total_steps + 1):
+                        resumed = BucketBatchSampler(groups, 8, rank, world, total_steps,
+                                                     start_step=start, seed=seed)
+                        self.assertEqual(len(resumed), total_steps - start)
+                        self.assertEqual(list(resumed), ranks[rank][start:])
 
     def test_image_preservation_and_iterator(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,6 @@
 from configs.i1_512 import get_config as _base_config
 from utils.config import ConfigDict
+from datasets.image_geometry import generate_buckets
 
 
 def get_config():
@@ -15,11 +16,12 @@ def get_config():
     config.keep_ckpt_steps = 5000
     config.input = ConfigDict(dict(
         type="bucketed",
-        manifest="/path/to/train.jsonl",
+        manifest="",  # --manifest /path/to/corrected_images.jsonl (see SFT.md)
         image_root="",  # Empty: resolve image paths relative to the manifest.
-        # (height, width); approximately 512^2 area, not a 512-pixel minimum side.
-        buckets=[(512, 512), (448, 592), (592, 448), (416, 640),
-                 (640, 416), (368, 720), (720, 368)],
+        # Lumina-style fixed pixel budget; retain exact 3:2 / 2:3 anchors.
+        # (height, width), at most 512^2 pixels, with no center cropping.
+        buckets=generate_buckets(512, step=32, max_ratio=3.0,
+                                 extra_shapes=[(416, 624), (624, 416)]),
         batch_size=32,
         num_workers=4,
         min_image_area=512 * 512,

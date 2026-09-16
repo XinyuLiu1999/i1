@@ -4,7 +4,9 @@ The SFT configs initialize from an existing i1 checkpoint, train on original
 images grouped into rectangular buckets, and accept captions up to 1,024 tokens.
 The VAE and T5Gemma encoder remain frozen; the DiT and its text adapter are trained.
 The JSONL SFT path does not require TensorFlow; the existing TFRecord training path
-is unchanged.
+is unchanged. After environment setup, follow the consolidated
+[CPU/GPU preflight workflow](#preflight-cpu-preparation-gpu-checks-and-training-smoke-test)
+before production training.
 
 ## Prepare the training environment
 
@@ -16,8 +18,6 @@ validated in this environment; the existing regression tests use tiny CPU models
 ### 1. Check the host and create an isolated environment
 
 ```bash
-nvidia-smi
-nvidia-smi topo -m
 cc --version
 
 conda create -n i1_sft python=3.11 -y
@@ -41,9 +41,9 @@ Keep `i1_sft` activated for every installation and training command below.
 
 The host also needs an NVIDIA driver compatible with the selected CUDA wheel and
 a working C/C++ compiler for `torch.compile`.
-The topology output should show the expected NVLink connections. In a container,
-make all eight allocated GPUs visible and provide enough shared memory for the
-data-loader workers.
+GPU visibility, topology, shared memory, compilation and communication are
+checked together in the preflight section below. On a CPU-only preparation host,
+skip the GPU-specific host requirements until moving to the GPU server.
 
 The wheel below uses CUDA 12.8. Installing it does not update the host driver.
 Do not rely only on the CUDA version printed by `nvidia-smi`: check the
@@ -59,7 +59,8 @@ python -m pip install "torch==2.9.1" --index-url https://download.pytorch.org/wh
 python -m pip install \
   "numpy==1.26.4" pillow tqdm \
   "transformers==4.57.1" "diffusers==0.35.1" \
-  accelerate safetensors sentencepiece "huggingface_hub>=0.34,<1.0"
+  accelerate safetensors sentencepiece "huggingface_hub>=0.34,<1.0" \
+  "pyarrow==22.0.0"
 python -m pip check
 ```
 
@@ -67,7 +68,8 @@ PyTorch 2.9.1 is pinned here to avoid accidentally installing a CPU-only or chan
 major-version environment. The other version pins follow the repository's training
 instructions. The model uses PyTorch scaled-dot-product attention; a separate
 `flash-attn` installation is not required. TensorFlow, torchvision, and torchaudio
-are not needed for the JSONL SFT path.
+are not needed for the JSONL or Parquet SFT paths. PyArrow is required for the
+prepared GPT-Image Parquet shards.
 
 Install `wandb` only if enabling `config.wandb.log_wandb`:
 
@@ -127,47 +129,323 @@ checkpoints include optimizer and EMA state and are larger than inference weight
 Keep the full repository checkout: inference imports shared helpers from
 `torch_train` and should not be run from a copied `generate.py` alone.
 
-### 4. Verify imports, CUDA, BF16, and compilation
+## Data formats and image policy
 
-Run this inside the activated environment on the allocated GPU server:
+GPT-Image-200K is stored in `/nfs_yaoyuan/liuxinyu/GPT-Image-200K/out_images`, with
+100 `shard_*/shard_*.parquet` files and 200,000 rows containing `id`, `prompt`,
+`size` and `image_bytes`. This corpus has incorrect `size` metadata: use the
+corrected-index workflow below before training. Do not use stale absolute
+`image_path` values from generation manifests or extract the entire 446 GB corpus.
+
+The generic alternative is a JSONL manifest:
+
+```json
+{"image_path":"images/poster.png","caption":"A poster with the heading ...","width":1600,"height":1200}
+```
+
+`prompt` is accepted instead of `caption`; captions must be nonempty. Relative
+image paths resolve against the manifest directory unless `input.image_root` is
+set. Optional dimensions must describe the image after EXIF orientation. Corrected
+Parquet indexes contain `id`, `caption`, `width`, `height`, `parquet_path`,
+`row_group` and `row_in_group`; relative Parquet paths resolve against the index.
+
+The default transform fits the entire image into its nearest eligible bucket and
+adds white padding, which receives normal image loss. It does not stretch, flip
+or randomly crop images. `resize_mode="crop"` explicitly enables center cropping;
+captions must then match the visible content. Source area and optional minimum
+short-side filters run before assignment; upscaling is disabled by default. Pixel
+area alone does not establish text readability. Square TFRecords cannot restore
+text removed by an earlier crop. See the resolution/batching reference below for
+bucket geometry and sampling details.
+
+## Preflight: CPU preparation, GPU checks, and training smoke test
+
+Follow this section in order before a full SFT run. CPU preparation produces a
+validated training input; GPU checks exercise the actual pretrained models,
+distributed execution, checkpoint/resume, and inference. Neither successful CPU
+checks nor a falling smoke-test loss establishes dense-text generation quality.
+
+| Phase | Where | Completion evidence |
+| --- | --- | --- |
+| CPU 1–2: environment, audit, cache | CPU host | Passing tests and accepted index/caption/cache reports. |
+| CPU 3–4: review, split, optional VAE check | CPU host | Reviewed text preservation and a fixed held-out set. |
+| GPU 1–2: host and communication | Eight-GPU server | CUDA/BF16/compile and NCCL checks pass. |
+| GPU 3–5: bucket coverage and training | Eight-GPU server | Encoder checks, all-bucket training, checkpoint and resume pass. |
+| GPU 6: inference and profiling | GPU server | Valid held-out samples and representative throughput/memory measurements. |
+
+### 0. Set paths and choose the resolution
+
+Activate the environment from the setup section. All commands in this section run
+from `i1/torch_train` unless a command explicitly changes directories. Replace
+placeholder paths once, and restore these variables when moving to the GPU host:
 
 ```bash
+conda activate i1_sft
+export I1_ROOT=/cephfs/liuxinyu/DenseText-Project/i1
+export GPT_IMAGE_200K=/nfs_yaoyuan/liuxinyu/GPT-Image-200K/out_images
+export SFT_AUDIT=/path/to/sft_precompute
+export SFT_RESOLUTION=1024
+export SFT_IMAGE_INDEX="$SFT_AUDIT/corrected_images.jsonl"
+export SFT_CACHE="$SFT_AUDIT/cache_${SFT_RESOLUTION}"
+export SFT_CONFIG="$I1_ROOT/torch_train/configs/sft_${SFT_RESOLUTION}.py"
+export SFT_INIT=/path/to/checkpoints/i1-3B/1024_resolution_checkpoint_torch.pt
+export SFT_WORKERS=8
+export SFT_WORKDIR=/path/to/new_sft_run
+mkdir -p "$SFT_AUDIT"
+cd "$I1_ROOT/torch_train"
+```
+
+For a 512 run, set `SFT_RESOLUTION=512`, update `SFT_CACHE` and `SFT_CONFIG`, and use
+the 512 initialization checkpoint. Build separate pixel caches for each resolution.
+Preserve the environment, bucket configuration and Pillow version used to build a
+cache. The existing run's location is listed in the artifact appendix; inspect its
+`status.json` before starting another pipeline against the same output directory.
+
+### CPU 1. Check the environment and available resources
+
+```bash
+python -m pip check
 python - <<'PY'
-import torch
-import transformers
-import diffusers
+import torch, transformers, diffusers, numpy, PIL, pyarrow
 from transformers import T5GemmaModel
 from diffusers import AutoencoderKL
 from torch.distributed.fsdp import fully_shard
+print("torch", torch.__version__, "transformers", transformers.__version__)
+print("diffusers", diffusers.__version__, "Pillow", PIL.__version__)
+print("NumPy", numpy.__version__, "PyArrow", pyarrow.__version__)
+PY
+python -m unittest discover -s "$I1_ROOT/torch_train/tests" -v
+python -m pip freeze > "$SFT_AUDIT/environment.txt"
+df -h "$SFT_AUDIT" /dev/shm
+```
 
+The regression tests use tiny CPU models and synthetic inputs; they do not load
+the production checkpoint or prove CUDA/FSDP correctness. They cover geometry,
+caption overflow, cache parity/integrity, sampling, checkpoint round trips, and
+CPU distributed communication.
+
+Check the job/container CPU quota rather than relying only on the host's reported
+CPU count. The current CPU container has an eight-core quota and 64 MiB `/dev/shm`.
+Use eight cache workers as a starting point. Budget approximately **622 GB at
+1024**, or **155 GB at 512**, for uint8 pixels, plus metadata and inspection images.
+The 446 GB source corpus remains in place. Do not store normalized float32 pixels:
+they require four times the pixel-cache space.
+
+### CPU 2. Build and audit the input, then precompute pixels
+
+Use **either** the automated pipeline **or** the individual commands below. Do not
+run both simultaneously against the same outputs. Prefetch the tokenizer using the
+setup section first; the pipeline runs Hugging Face operations offline.
+
+**Automated path:**
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m datasets.run_cpu_precompute \
+  --source "$GPT_IMAGE_200K" --output_dir "$SFT_AUDIT" \
+  --resolution "$SFT_RESOLUTION" --workers "$SFT_WORKERS"
+```
+
+It runs index construction, caption auditing, pixel precomputation, cache/duplicate
+checks, concurrent-reader benchmarking, and a 150-example gallery. Each stage has
+a log under `SFT_AUDIT`; `status.json` must report `complete` before treating the
+pipeline as finished. It does not perform manual visual review, create a held-out
+split, run the VAE diagnostic, or run any GPU training.
+
+**Individual stages / recovery:** run the required stage rather than restarting an
+already successful full decode. The pipeline itself starts with index construction
+when relaunched normally; the pixel exporter can reuse verified completed parts.
+
+```bash
+# a. Decode all original images and repair their dimension metadata.
+python -m datasets.build_image_index \
+  --manifest "$GPT_IMAGE_200K" --output "$SFT_IMAGE_INDEX" \
+  --workers "$SFT_WORKERS"
+
+# b. Audit all retained captions with the actual tokenizer; no encoder weights.
+python -m datasets.inspect_captions \
+  --manifest "$SFT_IMAGE_INDEX" --token_len 1024 \
+  --report "$SFT_AUDIT/caption_audit.json"
+
+# c. Apply the exact training transform to every eligible image and cache it.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m datasets.precompute_images \
+  --manifest "$SFT_IMAGE_INDEX" --output_dir "$SFT_CACHE" \
+  --resolution "$SFT_RESOLUTION" --workers "$SFT_WORKERS"
+
+# d. Check cache parity and identify duplicate candidates.
+python -m datasets.check_precompute \
+  --manifest "$SFT_CACHE/cache.jsonl" --resolution "$SFT_RESOLUTION" \
+  --report "$SFT_AUDIT/cache_checks.json"
+
+# e. Compare source versus cache loading with 1, 4, and 8 concurrent readers.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m datasets.benchmark_images \
+  --source_manifest "$SFT_IMAGE_INDEX" --cache_manifest "$SFT_CACHE/cache.jsonl" \
+  --resolution "$SFT_RESOLUTION" --report "$SFT_AUDIT/io_benchmark.json"
+
+# f. Produce the visual-review material used in CPU 3.
+python -m datasets.build_inspection_gallery \
+  --manifest "$SFT_IMAGE_INDEX" --output_dir "$SFT_AUDIT/gallery" --count 150
+```
+
+Review the outputs before proceeding:
+
+| Output | Required check |
+| --- | --- |
+| `corrected_images.report.json` | Every shard was processed; inspect corrected dimensions and all excluded records. |
+| `caption_audit.json` | Zero unintended overflows; inspect the longest captions and decoded tokenizer round trips. |
+| `cache_<resolution>/summary.json` | Expected retained/filter counts and bucket counts; `verified_all_written_bytes` is true. |
+| `cache_checks.json` | Pixel parity passed; review duplicate IDs, exact image/caption duplicates, and near-duplicate candidates. |
+| `io_benchmark.json` | Record throughput and tail latency; understand the measurement limits below. |
+| `gallery/index.html` | Material for human review, not an automatic quality approval. |
+
+The index builder fully decodes images, applies EXIF orientation, repairs sizes,
+and excludes undecodable images or empty captions. It aborts publication on a
+worker failure, unreadable row group, or missing required columns. The resulting
+JSONL references the original Parquet rows; it does not copy image bytes. Keep the
+source shards unchanged for later parity checks and galleries.
+
+`datasets.validate_images --manifest "$GPT_IMAGE_200K" --workers "$SFT_WORKERS"
+--report "$SFT_AUDIT/image_validation.json"` remains available as a strict audit of
+the original metadata: it exits nonzero on any issue. It repeats the full decode,
+so it is unnecessary when building a fresh corrected index. Merely constructing
+`BucketedImages` does not decode every image; the index and exporter perform that
+work explicitly.
+
+The pixel exporter stores the final RGB transform in per-bucket binary shards of
+at most 256 MiB, unless one image alone is larger. Every shard is read back and
+SHA256-checked against the bytes produced by the online transform. The final
+`cache.jsonl` is published only after every part succeeds. The independent checker
+compares online/cached pixels and normalized training tensors on a deterministic
+sample covering every populated bucket; it does not independently recompute every
+cached image. Resume reuses verified parts only with matching inputs/settings.
+Changed sources or transforms require a new output directory.
+Parts whose images are all filtered retain their exclusion counts and can be
+resumed. If the entire input is filtered, export fails before publishing a cache
+manifest. JSONL image paths honor `input.image_root` just as the training loader does.
+
+Cached training avoids PNG decoding, resizing and padding. Float normalization,
+frozen-VAE encoding, caption tokenization and frozen-text encoding remain online.
+The loader checks the transform fingerprint and preserves original-source filtering
+and bucket assignment. Keep `cache.jsonl` and `parts/` together when moving the cache.
+
+Caption limits are token counts, not character counts. The configs use 1,024 tokens
+and reject overflow. Resolve overflows before caching/training; do not silently
+summarize away intended text. `caption_overflow="truncate"` is an explicit opt-in,
+not the default. See the caption-conditioning notes below before changing the limit.
+
+The CPU benchmark includes filesystem-cache effects and concurrent read/transform
+work. It excludes DataLoader shared-memory queues, tokenization, GPU transfer and
+model computation. Repeat it on the GPU host's actual storage path. With global
+batch 32 and optimizer-step time `T` seconds, loading must sustain `32/T` images/s
+with headroom; the GPU smoke run determines `T`.
+
+### CPU 3. Review text preservation, duplicates, and evaluation separation
+
+Open `gallery/index.html`. It shows originals, 512/1024 processed images, full
+captions, token counts and assigned dimensions; its JSON sidecars preserve the
+selection. Sparse buckets receive fewer samples rather than duplicated examples.
+Selection covers the populated 512 buckets. Each source is checked separately
+against the 1024 training policy; ineligible sources are marked as excluded instead
+of showing an upscaled 1024 preview.
+Inspect 100–200 examples across all populated shapes, including small text, long
+documents, numbers/formulas, extreme aspect ratios and text at image edges. Use
+native pixels and enlarged text crops; thumbnails can hide missing characters.
+Check caption–image alignment and record rejected IDs and reasons.
+
+White padding preserves image extent but cannot prevent downsampling from erasing
+small characters. Avoid stretching or cropping captioned text. If readability is
+already poor after resizing, revise resolution/data selection before training.
+
+Review duplicate reports before fixing a held-out evaluation set. Exact image
+hashes use decoded RGB pixels; identical captions are not automatically duplicate
+images. The dHash screen is **non-exhaustive**, with dense-bin and candidate limits;
+its matches require review. The tools do not automatically remove records or make
+a split. Keep duplicates/related variants within one split, and include different
+text densities and aspects in evaluation. Do not tune on held-out examples.
+
+Write the approved training/evaluation manifests **beside `cache.jsonl`** to retain
+relative `parts/` references, or rewrite those references as absolute paths. Set:
+
+```bash
+export SFT_TRAIN_MANIFEST="$SFT_CACHE/train.jsonl"
+export SFT_EVAL_PROMPTS="$SFT_AUDIT/held_out_prompts.txt"
+```
+
+These are files you create after review, not automatic pipeline outputs. Preserve
+full cache-record fields when filtering a manifest. The prompt file contains one
+held-out prompt per line; include long prompts with exact intended strings.
+
+### CPU 4. Optional small VAE diagnostic and deferred compute
+
+If the frozen VAE weights are cached, run a small deterministic reconstruction
+check on CPU. This is useful before GPU allocation but can be slow:
+
+```bash
+HF_HUB_OFFLINE=1 python -m datasets.inspect_vae_reconstructions \
+  --manifest "$SFT_IMAGE_INDEX" --output_dir "$SFT_AUDIT/vae_cpu" --count 2
+```
+
+The current helper is CPU-only and checks up to two populated buckets at **each**
+resolution, using one example per selected bucket. It saves processed/reconstructed
+PNGs, finiteness/normalization-round-trip results and pixel metrics. Inspect the
+text: PSNR is not a transcription metric. Use the GPU probe below for broader
+coverage. Diagnostics use the VAE posterior's mode; training samples its posterior.
+
+Do not precompute T5Gemma embeddings or VAE latents as a prerequisite. Their cache
+readers are not implemented. Start with online encoding and profile on GPUs first.
+The existing pixel cache already removes image decoding and resize costs. Details
+and storage estimates for possible future embedding caches are below.
+
+**CPU exit criteria:** accepted index/exclusions, no unintended caption overflow,
+verified cache, reviewed visual examples/duplicates, and a fixed held-out split.
+An automated `complete` status alone does not satisfy the manual-review criteria.
+
+### GPU 1. Stage inputs and check CUDA, compilation, and shared memory
+
+On the allocated eight-A800 server, activate the same environment and restore the
+paths from step 0 plus `SFT_TRAIN_MANIFEST` and `SFT_EVAL_PROMPTS`. If moving the
+cache, copy its complete directory and use paths valid on this host. Pre-stage the
+VAE, tokenizer/text-encoder weights and matching i1 checkpoint; eight workers
+should not begin by downloading the same model. Keep TorchInductor/Triton cache
+directories writable. Repeat CPU imports/tests if this is a different environment.
+
+```bash
+nvidia-smi
+nvidia-smi topo -m
+cc --version
+df -h /dev/shm
+test -s "$SFT_TRAIN_MANIFEST"
+test -s "$SFT_INIT"
+python - <<'PY'
+import torch
 print("PyTorch:", torch.__version__, "CUDA runtime:", torch.version.cuda)
-print("Transformers:", transformers.__version__, "Diffusers:", diffusers.__version__)
-assert torch.cuda.is_available(), "CUDA is unavailable; check driver and GPU visibility."
-assert torch.cuda.device_count() == 8, "Expected eight visible GPUs for this setup."
-assert torch.cuda.is_bf16_supported(), "BF16 is unavailable."
-for index in range(torch.cuda.device_count()):
-    props = torch.cuda.get_device_properties(index)
-    print(index, props.name, f"{props.total_memory / 2**30:.1f} GiB")
-
+assert torch.cuda.is_available()
+assert torch.cuda.device_count() == 8, "Expected eight visible GPUs."
 @torch.compile
 def compiled_op(x):
     return torch.nn.functional.silu(x @ x)
-
-x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-assert torch.isfinite(compiled_op(x)).all().item()
-torch.cuda.synchronize()
-print("CUDA/BF16/compile check passed")
+for index in range(8):
+    with torch.cuda.device(index):
+        assert torch.cuda.is_bf16_supported(), f"BF16 unavailable on GPU {index}"
+        props = torch.cuda.get_device_properties(index)
+        x = torch.randn(128, 128, device=f"cuda:{index}", dtype=torch.bfloat16)
+        assert torch.isfinite(compiled_op(x)).all().item()
+        torch.cuda.synchronize()
+        print(index, props.name, f"{props.total_memory / 2**30:.1f} GiB", "passed")
 PY
 ```
 
-This performs a small GPU computation without loading pretrained weights. A
-compilation failure should be resolved before using the default compiled training
-config. `config.compile=False` can be used to diagnose training in eager mode.
+Confirm the expected NVLink topology and compatible driver. Resolve compile failures
+before testing the compiled trainer; `config.compile=False` in a copied config is
+an eager-mode diagnostic, not proof that the default compiled setup works.
 
-### 5. Verify communication between all eight GPUs
+The default eight-rank 1024 DataLoader can queue approximately **3 GiB of float32
+images**, before active batches, pinned copies and other overhead. A 64 MiB
+`/dev/shm` mount is insufficient. Allocate several GiB with headroom (for example,
+16 GiB for this starting configuration) through the container/job launcher.
+`config.input.num_workers=0` is a debugging fallback, not the production throughput
+test. Confirm the actual target-host CPU quota, RAM, shared memory and storage rate.
 
-This small NCCL check verifies the distributed launch and a collective operation;
-it does not benchmark interconnect bandwidth or validate full FSDP training:
+### GPU 2. Verify communication between all eight ranks
 
 ```bash
 i1_check_dir=$(mktemp -d)
@@ -176,7 +454,6 @@ import os
 from datetime import timedelta
 import torch
 import torch.distributed as dist
-
 local_rank = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(local_rank)
 dist.init_process_group("nccl", timeout=timedelta(minutes=2))
@@ -184,7 +461,7 @@ rank, world = dist.get_rank(), dist.get_world_size()
 assert world == 8
 value = torch.tensor([rank + 1.0], device=f"cuda:{local_rank}")
 dist.all_reduce(value)
-assert value.item() == world * (world + 1) / 2
+assert value.item() == 36.0
 torch.cuda.synchronize()
 if rank == 0:
     print("Eight-GPU NCCL all-reduce passed")
@@ -195,124 +472,217 @@ rm "$i1_check_dir/check_nccl.py"
 rmdir "$i1_check_dir"
 ```
 
-Finally, from the repository root, run the lightweight regression tests and record
-the resolved environment alongside your experiment files:
+This verifies launch/collectives, not communication bandwidth or full FSDP training.
+
+### GPU 3. Prepare a smoke input that actually covers every bucket
+
+A short count-weighted run on the original corpus can miss rare buckets. Create a
+**diagnostic-only** manifest with 32 entries per populated bucket, using shorter
+and longer captions by character length as candidate examples. CPU caption auditing
+has already checked actual token lengths; character length here only selects
+examples. Repetition is intentional for this hardware test, not data augmentation.
+All cache paths are made absolute so this manifest can live outside the cache.
 
 ```bash
-cd /path/to/i1
-python -m unittest discover -s torch_train/tests -v
-python -m pip freeze > /path/to/experiment/i1-sft-environment.txt
-cd torch_train
+export SFT_SMOKE_DIR="$SFT_AUDIT/gpu_smoke_${SFT_RESOLUTION}"
+mkdir -p "$SFT_SMOKE_DIR"
+python - <<'PY'
+import json, os
+from dataclasses import asdict
+from pathlib import Path
+from training.main import load_config
+from datasets.bucketed import BucketedImages, BucketBatchSampler
+config = load_config(os.environ["SFT_CONFIG"])
+config.input.manifest = os.environ["SFT_TRAIN_MANIFEST"]
+data = BucketedImages(config.input)
+root = Path(os.environ["SFT_SMOKE_DIR"])
+manifest = root / "manifest.jsonl"
+with manifest.open("w") as handle:
+    for group in data.groups:
+        if not group:
+            continue
+        candidates = [min(group, key=lambda i: len(data.records[i][0].caption)),
+                      max(group, key=lambda i: len(data.records[i][0].caption))]
+        for j in range(32):
+            record = data.records[candidates[j % 2]][0]
+            row = {key: value for key, value in asdict(record).items() if value is not None}
+            row["id"] = row.pop("identifier")
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+config.input.manifest = str(manifest)
+smoke = BucketedImages(config.input)
+expected = {i for i, group in enumerate(smoke.groups) if group}
+seen = set()
+# Same global batch, seed and step numbering as the eight-rank trainer.
+for step, indices in enumerate(BucketBatchSampler(smoke.groups, 32, 0, 1, 4096,
+                                                seed=config.seed), 1):
+    seen.add(smoke.records[indices[0]][3])
+    if seen == expected:
+        steps = max(100, step + 10)
+        break
+else:
+    raise RuntimeError("Could not establish deterministic bucket coverage.")
+(root / "steps.txt").write_text(str(steps) + "\n")
+(root / "coverage.json").write_text(json.dumps(dict(
+    seed=config.seed, global_batch=32, first_full_coverage_step=step,
+    smoke_steps=steps, buckets=[smoke.buckets[i] for i in sorted(seen)]), indent=2))
+print(f"Prepared {len(smoke)} entries; {len(seen)} buckets covered by step {step}.")
+PY
+export SFT_SMOKE_STEPS=$(cat "$SFT_SMOKE_DIR/steps.txt")
 ```
 
-Create `/path/to/experiment` first and replace all placeholder paths. The training
-and caption-audit commands below run from `i1/torch_train`. On later logins, run
-`conda activate i1_sft` and restore the cache variables before running them.
+Keep this manifest/config/seed unchanged through the smoke and resume checks.
+The coverage calculation is invalid if these settings or global batch size change.
+A bucket with only one source cannot provide two different caption lengths; use
+the longest available captions in other buckets and long held-out inference prompts.
 
-## Data
+### GPU 4. Check the frozen encoders and VAE reconstructions
 
-Create a JSONL manifest, one image and caption per line:
-
-```json
-{"image_path":"images/poster.png","caption":"A poster with the heading ...","width":1600,"height":1200}
-```
-
-`prompt` is also accepted instead of `caption`. Paths are relative to the manifest
-unless `config.input.image_root` is set. Dimensions are optional; supplying them
-avoids scanning image headers during dataset construction. Dimensions must describe
-the image after EXIF orientation is applied, and are checked when loading pixels.
-Captions must be nonempty strings. Keep the exact intended text in the captions.
-
-The default transform fits the entire image into its nearest eligible aspect-ratio
-bucket and adds white padding. This retains text at the image edges. Padding is
-part of the training image and receives the normal image loss. `resize_mode="crop"`
-enables resize-and-center-crop instead, but captions must then match the visible
-content. No stretching, random cropping, or horizontal flipping is applied.
-
-Source images below the configured pixel area are filtered; upscaling is disabled
-by default. `min_image_side` can additionally enforce a minimum short side. Inspect
-preprocessed samples for readable characters: pixel area alone does not ensure it.
-Square TFRecords cannot recover text already removed by their original crop.
-
-## Check caption lengths first
-
-From `i1/torch_train`:
+Run this **single-process** probe before `torchrun`. It checks one shorter/longer
+candidate pair per populated bucket, verifies tensor contracts/finiteness, and
+saves VAE reconstructions for native-pixel inspection. It uses posterior mode and
+reverses the training normalization before decoding. Review text-heavy cases;
+add examples if the selected subset does not represent difficult small text.
 
 ```bash
-python -m datasets.inspect_captions --manifest /path/to/train.jsonl --token_len 1024
+python - <<'PY'
+import os
+from pathlib import Path
+from PIL import Image
+import torch
+from training.main import load_config
+from datasets.bucketed import BucketedImages
+from datasets.captions import tokenize_captions
+from text_encoder.text_encoder import TextEncoder, encode_text_encoder
+from vae.vae import load_vae, encode_images_to_latents, scale_latents, reverse_scale_latents
+config = load_config(os.environ["SFT_CONFIG"])
+root = Path(os.environ["SFT_SMOKE_DIR"])
+config.input.manifest = str(root / "manifest.jsonl")
+data = BucketedImages(config.input)
+device = torch.device("cuda:0")
+bundle = TextEncoder(config, config.text_encoder_type, config.token_len,
+                     weight_dtype=torch.bfloat16, device=device)
+vae = load_vae(config, device, dtype=torch.float32)
+output = root / "vae_gpu"
+output.mkdir(exist_ok=True)
+with torch.inference_mode():
+    for bucket, group in enumerate(data.groups):
+        for ordinal, index in enumerate(group[:2]):
+            pixels, caption = data[index]
+            h, w = pixels.shape[:2]
+            tokens = tokenize_captions(bundle.tokenizer, [caption], config.token_len)
+            ids, mask = (tokens[key].to(device) for key in ("input_ids", "attention_mask"))
+            hidden = encode_text_encoder(bundle.text_encoder, ids, mask)
+            assert ids.shape == mask.shape == (1, 1024)
+            assert hidden.shape == (1, 1024, 2304) and torch.isfinite(hidden).all()
+            latents = encode_images_to_latents(vae, pixels[None].to(device), sample=False)
+            normalized = scale_latents(latents, config)
+            assert normalized.shape == (1, 32, h // 8, w // 8)
+            assert torch.isfinite(normalized).all()
+            restored = reverse_scale_latents(normalized, config.vae_type)
+            torch.testing.assert_close(restored, latents, rtol=1e-5, atol=1e-5)
+            decoded = vae.decode(restored).sample[0].permute(1, 2, 0)
+            assert decoded.shape == pixels.shape and torch.isfinite(decoded).all()
+            for label, image in (("processed", pixels), ("reconstructed", decoded.cpu())):
+                rgb = ((image.float().clamp(-1, 1) + 1) * 127.5).round().byte().numpy()
+                Image.fromarray(rgb).save(output / f"b{bucket:02d}_{ordinal}_{label}.png")
+            print(bucket, (h, w), "caption tokens", mask.sum().item(), "passed")
+PY
 ```
 
-This loads only the T5Gemma tokenizer and reports token-count percentiles, maximum,
-and the number exceeding the limit. It exits nonzero if any caption exceeds the
-limit. Model access must already be configured for the Google checkpoint.
+The assertions target the supplied 1,024-token configs. Adjust them deliberately
+when testing a different token limit. These checks do not replace DiT forward and
+backward validation in the distributed training run below.
 
-Character count is not a reliable token limit. The SFT configs use 1,024 tokens;
-the data loader raises on overflow rather than silently dropping text. Choose a
-different limit with `--token_len` when initializing a new SFT run. Explicitly set
-`config.input.caption_overflow="truncate"` only if truncation is intended.
+### GPU 5. Run compiled eight-GPU training, save, and resume
 
-The embedding width remains 2,304. Increasing the limit changes sequence length,
-text RoPE capacity, and the learned null-caption tensor. Fresh checkpoint
-initialization preserves the null-caption prefix and tiles it to initialize extra
-positions. The new positions are trainable. All other compatible model weights
+Use a **new** smoke workdir: an existing `checkpoint.pt` takes precedence over fresh
+initialization. For the default global batch 32, eight data-parallel ranks and four
+accumulation steps, each rank processes four images with microbatch size one.
+
+```bash
+set -o pipefail
+torchrun --standalone --nproc_per_node=8 -m training.main \
+  --config "$SFT_CONFIG" --manifest "$SFT_SMOKE_DIR/manifest.jsonl" \
+  --init_from "$SFT_INIT" --workdir "$SFT_SMOKE_DIR/train" \
+  --fsdp 8 --batch_size 32 --grad_accum 4 \
+  --total_steps "$SFT_SMOKE_STEPS" --ckpt_steps "$SFT_SMOKE_STEPS" --log_every 1 \
+  2>&1 | tee "$SFT_SMOKE_DIR/train.log"
+
+# total_steps is the cumulative stopping step, not the number of extra steps.
+torchrun --standalone --nproc_per_node=8 -m training.main \
+  --config "$SFT_CONFIG" --manifest "$SFT_SMOKE_DIR/manifest.jsonl" \
+  --resume "$SFT_SMOKE_DIR/train/checkpoint.pt" --workdir "$SFT_SMOKE_DIR/train" \
+  --fsdp 8 --batch_size 32 --grad_accum 4 \
+  --total_steps "$((SFT_SMOKE_STEPS + 20))" --ckpt_steps 20 --log_every 1 \
+  2>&1 | tee "$SFT_SMOKE_DIR/resume.log"
+```
+
+**Pass criteria:** every scheduled bucket executes; loss, `l2_grads` and
+`l2_updates` remain finite; updates are nonzero; no OOM, loader stalls, collective
+hangs or repeated compile failures occur; the checkpoint is saved; and resume logs
+`resumed at step <SFT_SMOKE_STEPS>` and continues to the larger target step. Inspect
+the logs—these commands do not install an automatic finite-value assertion for
+every intermediate model tensor. The frozen-encoder probe above checks embeddings
+and latents explicitly. Resume restores optimizer and EMA state, but the trainer
+does not checkpoint all noise/dropout RNG state, so bitwise continuation is not a
+pass criterion.
+
+### GPU 6. Generate, then measure representative training throughput
+
+Generate from the saved smoke checkpoint using held-out long prompts, with prompt
+rewriting disabled. This tests checkpoint/inference compatibility, not final SFT
+quality. Repeat at portrait/landscape shapes used by the intended run:
+
+```bash
+python "$I1_ROOT/torch_inference/generate.py" \
+  --checkpoint "$SFT_SMOKE_DIR/train/checkpoint.pt" \
+  --height 832 --width 1248 --prompts-file "$SFT_EVAL_PROMPTS" \
+  --rewrite-prompt false --num-steps 50 --outdir "$SFT_SMOKE_DIR/samples"
+```
+
+The example shape is for 1024; use `416 x 624` for its 512 counterpart. Inspect
+exact spelling, numbers, line breaks, layout and edge text. Compare production
+experiments against the original checkpoint at matched output shapes and inference
+settings; a decreasing training loss alone is insufficient.
+
+Finally, use the **approved full training split**, its actual storage location and
+production DataLoader settings for a throughput trial in another fresh workdir:
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m training.main \
+  --config "$SFT_CONFIG" --manifest "$SFT_TRAIN_MANIFEST" \
+  --init_from "$SFT_INIT" --workdir "$SFT_SMOKE_DIR/throughput" \
+  --fsdp 8 --batch_size 32 --grad_accum 4 \
+  --total_steps 300 --log_every 10 --no_save \
+  2>&1 | tee "$SFT_SMOKE_DIR/throughput.log"
+```
+
+Exclude model startup, compilation and storage warmup; retain approximately 200
+steady-state steps, extending the trial if 300 total steps do not provide that
+window. The balanced smoke input deliberately oversamples rare buckets, so its
+throughput is not the production estimate. Watch for recompilation when a shape
+appears for the first time in this process. Record images/s, step-time variation,
+data-loading waits, CPU/storage utilization and per-rank GPU memory. The trainer
+logs aggregate images/s, not separate loader timing or peak CUDA memory: obtain
+those with a profiler or explicit timing/memory instrumentation on the GPU host.
+Do not infer peak memory from successful CPU tests or from a single GPU snapshot.
+
+**GPU exit criteria:** CUDA/compile and NCCL checks pass; encoder/VAE outputs and
+text reconstructions are acceptable; all buckets pass forward/backward; save/resume
+and held-out inference work; and representative throughput/memory fit the target
+server. Start full SFT from the intended original checkpoint in a new production
+workdir, using the approved training split—not the balanced smoke manifest or its
+short-run checkpoint.
+
+## Caption conditioning and optional encoder caches
+
+The supplied SFT configs use 1,024 caption tokens and an embedding width of 2,304.
+Changing the limit changes sequence length, text RoPE capacity and the learned
+null-caption tensor. Fresh checkpoint initialization preserves the null-caption
+prefix and tiles it into new trainable positions; other compatible model weights
 are retained. This is an initialization strategy, not a guarantee of long-caption
-generation quality; evaluate the resulting conditioning after SFT.
-
-## Preflight image and text processing
-
-Before committing to a full run, perform the following checks in order. Audit the
-whole dataset for mechanical errors, then inspect representative examples for
-readability and image-caption alignment.
-
-1. **Validate every image-caption record.** Decode all images and check their
-   EXIF-corrected dimensions against the manifest. Check for missing/corrupt files,
-   invalid captions, and unintended duplicates. Report filtered examples and the
-   number assigned to each bucket. Merely constructing `BucketedImages` does not
-   fully validate image files when width and height are supplied: pixels are read
-   in `__getitem__`. Exercise the actual loading/transform path for every eligible
-   record before launching distributed training.
-2. **Audit all captions with the actual tokenizer.** Run `datasets.inspect_captions`
-   above and resolve every overflow. English captions of 1,000–2,500 characters
-   still need token counts; character counts do not establish that they fit.
-   Inspect tokenized-and-decoded examples containing numbers, punctuation, unusual
-   words, and long quoted passages. Preserve exact intended spelling, punctuation,
-   and meaningful line breaks. Do not automatically summarize captions just to
-   fit the limit, since that can discard the text the model should render.
-3. **Inspect 100–200 processed examples across all buckets.** Include small text,
-   long documents, extreme aspect ratios, and text near image edges. Display each
-   original beside the actual resized/padded training image, with its full caption,
-   token count, source dimensions, and assigned bucket. Include enlarged text crops
-   and inspect at native pixel size; a small contact-sheet thumbnail can hide lost
-   characters. Confirm that the caption belongs to the image and accurately states
-   its visible text. White padding prevents geometric cropping, but downsampling
-   can still erase characters. Repeat this check for both 512 and 1024 configs.
-4. **Inspect VAE reconstructions for 20–50 text-heavy examples.** Compare the
-   processed image with its reconstruction from the frozen FLUX.2 VAE, including
-   enlarged text crops. Use the latent distribution's mode for a deterministic
-   diagnostic; training currently samples latents. If testing normalized latents,
-   reverse the training normalization before decoding. This separates losses from
-   resizing and VAE compression from denoiser behavior. If characters are already
-   badly degraded here, address resolution or data selection before a long SFT.
-5. **Run a short training smoke test.** Exercise every populated bucket and both
-   short and long captions. Verify finite text embeddings, latents, losses, and
-   gradients. For the supplied configs, image batches are NHWC floats in [-1, 1],
-   token IDs/masks have shape `(B, 1024)`, encoder outputs `(B, 1024, 2304)`, and
-   normalized latents `(B, 32, H/8, W/8)`. Save a checkpoint, resume it, and generate
-   with held-out long prompts with rewriting disabled. A decreasing training loss
-   alone does not demonstrate improved transcription or layout. After warming up
-   every bucket, measure about 200 steady-state steps on the intended eight-GPU
-   setup to establish throughput and peak memory.
-
-Keep a held-out evaluation set separate before selecting hyperparameters. Include
-different text densities and aspect ratios, and compare exact text/transcription
-errors as well as visual layout against the original checkpoint.
-
-Only the caption-length audit is currently provided as a standalone audit command.
-The preprocessing galleries, full image validation report, and VAE reconstruction
-report described here are recommended preflight tasks, not implemented commands.
-The synthetic tests below do not replace these checks on your real data and models.
-
-## Is offline text preprocessing necessary?
+rendering quality. Validate conditioning after SFT. Set a different limit only for
+a new run, and rebuild smoke assertions/cache plans as needed.
 
 **Validate and count tokens for all captions; precomputing all embeddings is not
 required.** The current trainer tokenizes captions and runs the frozen T5Gemma
@@ -345,21 +715,17 @@ and storage bandwidth; a frozen encoder makes caching possible, not mandatory.
 
 ## Train
 
-```bash
-# Initialize from the 512 checkpoint, approximately 512^2 pixel-area buckets.
-torchrun --nproc_per_node=8 -m training.main \
-  --config configs/sft_512.py \
-  --manifest /path/to/train.jsonl \
-  --init_from /path/to/512_resolution_checkpoint_torch.pt \
-  --workdir /path/to/sft_512 --fsdp 8
+Complete the preflight above first. Set `SFT_TRAIN_MANIFEST` to the approved
+training split for the selected resolution. Use a fresh production workdir.
 
-# Initialize from the 1024 checkpoint, approximately 1024^2 pixel-area buckets.
-torchrun --nproc_per_node=8 -m training.main \
-  --config configs/sft_1024.py \
-  --manifest /path/to/train.jsonl \
-  --init_from /path/to/1024_resolution_checkpoint_torch.pt \
-  --workdir /path/to/sft_1024 --fsdp 8
+```bash
+torchrun --standalone --nproc_per_node=8 -m training.main \
+  --config "$SFT_CONFIG" --manifest "$SFT_TRAIN_MANIFEST" \
+  --init_from "$SFT_INIT" --workdir "$SFT_WORKDIR" --fsdp 8
 ```
+
+Use the matching config, initialization checkpoint and pixel cache for the selected
+512 or 1024 resolution; they are not interchangeable.
 
 The examples assume the 3B architecture selected by the configs. Set `model_size`
 to the matching preset when using a different checkpoint architecture. Incompatible
@@ -371,11 +737,21 @@ existing `checkpoint.pt` in the workdir takes precedence so interrupted jobs can
 restart with their original launch command. Use a new workdir for a new SFT run.
 Missing checkpoint paths fail rather than falling back to random initialization.
 
-The starting configs use learning rate `1e-5`, 10,000 steps, global batch 32, four
-accumulation microbatches per rank, and activation checkpointing. These are starting
-settings to tune, not a validated dense-text recipe. Global batch must be divisible
-by data-parallel world size and the resulting local batch by accumulation count.
-Use `--batch_size`, `--grad_accum`, and `--total_steps` for overrides.
+The 1024 starting config uses one epoch, learning rate `1e-5`, global batch 32, four
+accumulation microbatches per rank, EMA decay `0.9995`, logging every 50 steps,
+rolling checkpoints every 1,000 steps, retained checkpoint copies every 2,500
+steps, and activation checkpointing. After loading and filtering the final manifest,
+the trainer resolves the exact stopping step as
+`sum(ceil(bucket_count / global_batch))`; this is roughly 6,250 steps for 200,000
+images. The 512 config retains its shorter step-based baseline settings. These are
+starting settings to select with held-out rendering evaluation, not a validated
+dense-text recipe. Global batch must be divisible by data-parallel world size and
+the resulting local batch by accumulation count. Use `--batch_size`, `--grad_accum`,
+and `--total_steps` for overrides; an explicit `--total_steps` takes precedence
+over `num_epochs` for smoke tests and controlled runs.
+W&B remains opt-in through `config.wandb.log_wandb`; when enabled, rank zero reports
+the resolved batch decomposition, parallel sizes, optimizer/runtime settings,
+checkpoint cadence, sampler steps per epoch, and training metrics.
 
 ## Resolution and batching behavior
 
@@ -386,14 +762,36 @@ buckets explicitly when the source data and memory budget justify them. Each ima
 is assigned to its closest eligible aspect ratio, with ties favoring the larger
 area. This assignment is fixed; it does not randomly resize each image every step.
 
-Each optimizer step samples one nonempty bucket, weighted by its eligible image
-count. All data-parallel workers use the same shape and receive slices of one
-global sampled batch. Sampling is without replacement within that batch unless
-the bucket contains fewer images than the global batch size. The sampler is a
-deterministic function of seed and step. Preserve the manifest/order, bucket config,
-seed, world size, and batch size when resuming to retain the same sample sequence.
-Noise/dropout RNG state is not checkpointed by the existing trainer, so resume is
-not a bitwise-identical continuation of the entire training computation.
+The defaults adapt Lumina-Image-2.0's `imgproc.generate_crop_size_list` approach:
+generate quantized candidate shapes along a fixed pixel-budget boundary, then
+choose by aspect ratio. Here `datasets.image_geometry.generate_buckets` uses a
+32-pixel grid at 512, a maximum long/short ratio of 3, and adds the exact 3:2 / 2:3
+anchors. The 1024 config doubles these dimensions. There are 25 candidate shapes;
+18 receive images in the audited size histogram. All have area at most the base
+resolution squared. Empty buckets are not sampled. Lumina's center crop is replaced
+by fit-and-pad to preserve captioned edge text. Its mixed-shape attention masks
+are not needed for this trainer's existing homogeneous batches.
+
+This changes bucket assignments and sampling relative to the earlier two-bucket
+configs: start a new run/workdir. Keep the old config and manifest when resuming
+an existing run. The two-bucket gallery in the artifact appendix is historical.
+
+The epoch-aware sampler independently shuffles every nonempty bucket, divides it
+into homogeneous global batches, and randomly interleaves those batches across
+aspect ratios. It exhausts every eligible image before reshuffling for the next
+epoch. An incomplete bucket tail wraps to the beginning of that epoch's shuffled
+order so batch size and distributed slicing stay fixed; buckets smaller than the
+global batch necessarily repeat examples. One sampler epoch therefore takes
+`sum(ceil(bucket_count / global_batch))` optimizer steps. All data-parallel workers
+receive disjoint rank slices of the same global batch except when a bucket itself
+is smaller than the global batch.
+
+The batch plan is a deterministic function of seed and epoch, and resume derives
+the epoch and within-epoch offset from the saved optimizer step. Preserve the
+manifest/order, bucket config, seed, world size, and batch size when resuming to
+retain the same sample sequence. Noise/dropout RNG state is not checkpointed by
+the existing trainer, so resume is not a bitwise-identical continuation of the
+entire training computation.
 
 Tensor-parallel workers receive tensor dimensions before allocating each batch.
 Compiled blocks use dynamic shapes; set `config.compile=False` for eager execution.
@@ -414,11 +812,11 @@ From `i1/torch_inference`:
 
 ```bash
 python generate.py \
-  --checkpoint /path/to/sft_1024/checkpoint.pt \
+  --checkpoint "$SFT_WORKDIR/checkpoint.pt" \
   --height 896 --width 1184 \
   --prompts-file /path/to/held_out_prompts.txt \
   --rewrite-prompt false \
-  --outdir /path/to/sft_samples
+  --outdir "$SFT_WORKDIR/samples"
 ```
 
 Height and width default to the checkpoint's base square resolution. Caption
@@ -431,17 +829,36 @@ at matched output shapes. Measure exact text/transcription errors and inspect te
 layout, including small text and content near image edges. Successful shape tests
 do not establish generation-quality gains.
 
-## Lightweight verification
+## Artifact inventory and recorded results (2026-09-16)
 
-From the repository root:
+These are historical observations, not substitutes for the exit criteria above.
+The active pipeline records live state separately from completed smoke reports.
 
-```bash
-python -m unittest discover -s torch_train/tests -v
-```
+| Artifact root | Contents and interpretation |
+| --- | --- |
+| `/cephfs/liuxinyu/DenseText-Project/artifacts/gpt_image_200k_sft_audit` | Original full caption/image audits, geometry comparison, and historical galleries. |
+| `/cephfs/liuxinyu/DenseText-Project/artifacts/gpt_image_200k_sft_audit/lumina_index_smoke` | Shard-00000 corrected index, transform checks and a 100-example gallery; this gallery skipped tokenizer execution. |
+| `/cephfs/liuxinyu/DenseText-Project/artifacts/gpt_image_200k_sft_precompute` | Full pipeline outputs/logs and `status.json`; inspect live status rather than assuming completion. Also contains `cache_smoke_1024`, `cache_smoke_checks.json`, and separate `vae_smoke` diagnostics. |
 
-The tests use tiny synthetic models, CPU tensors, and a fake tokenizer. They cover
-rectangular shapes, positional consistency, long-caption CFG, checkpoint loading,
-optimizer/EMA round trips, training/inference parity, compilation with activation
-checkpointing, deterministic sampling, image padding, overflow handling, and a
-two-process Gloo broadcast. They do not download pretrained weights or validate a
-full CUDA/FSDP training run.
+The original 200,000-caption audit found p50 567, p95 632, p99 657 and maximum
+732 tokens, with zero over 1,024. The full image decode checked 200,000 rows in
+1,458 seconds: 199,999 decoded and one PNG was truncated,
+`sciformula_mathematics_1c47358aa86c1730_codex` (shard 00000, row group 147, row 1).
+It found 36,115 incorrect declared sizes: 14,721 reversed orientations and 21,394
+images outside exact 3:2/2:3 geometry. Correct the dimensions and keep valid other
+aspects; the earlier exact-aspect-only baseline contained 178,605 images.
+
+The original `preprocessing_gallery` used only two exact-aspect buckets and is
+historical, not coverage of the current generated set. The complete size histogram
+predicts 18 populated shapes among 25 candidates. At 1024, calculated mean padding
+falls from 2.568% with two buckets to 0.220%, and maximum padding from 50% to 6.971%.
+These are geometric estimates, not measured generation-quality gains.
+
+The real shard-00000 index smoke test retained 1,999 images, corrected 318 sizes
+and excluded the known corrupt PNG. Both resolutions passed sample transform checks
+across its 11 populated buckets. Its 1024 pixel cache wrote 6,214,569,984 verified
+bytes; a separate 43-example parity check covered all 11 buckets and passed. The
+18-test CPU regression suite passed, including cache integrity, sampling, duplicate
+reporting and concurrent-reader tests. Full pretrained GPU/FSDP training is not
+established by these CPU results. Consult the VAE reports/logs for their actual
+coverage rather than treating generated inspection images as human approval.

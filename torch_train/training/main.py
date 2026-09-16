@@ -51,7 +51,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--workdir", default=None)
-    parser.add_argument("--total_steps", type=int, default=None, help="Override config.total_steps.")
+    parser.add_argument("--total_steps", type=int, default=None,
+                        help="Override config.total_steps and any configured num_epochs.")
     parser.add_argument("--batch_size", type=int, default=None, help="Override config.input.batch_size.")
     parser.add_argument("--log_every", type=int, default=None, help="Override config.log_training_steps.")
     parser.add_argument("--no_save", action="store_true", help="Disable checkpoint saving.")
@@ -66,7 +67,8 @@ def main():
     checkpoints = parser.add_mutually_exclusive_group()
     checkpoints.add_argument("--resume", default=None, help="Resume a training checkpoint, including optimizer and step.")
     checkpoints.add_argument("--init_from", default=None, help="Initialize fresh SFT from model/EMA weights only.")
-    parser.add_argument("--manifest", default=None, help="JSONL image/caption manifest for bucketed SFT.")
+    parser.add_argument("--manifest", default=None,
+                        help="JSONL manifest, Parquet shard, or GPT-Image output directory for bucketed SFT.")
     parser.add_argument("--token_len", type=int, default=None, help="Maximum caption tokens for a new training run.")
     args = parser.parse_args()
 
@@ -132,7 +134,7 @@ def main():
 
     bucketed = config.input.get("type", "tfrecord") == "bucketed"
     if bucketed:
-        from datasets.bucketed import BucketedImages, build_bucket_iterator
+        from datasets.bucketed import BucketedImages, bucket_steps_per_epoch, build_bucket_iterator
         multiple = VAE_CONFIGS[config.vae_type]["vae_compression_factor"] * config.patch_size
         train_ds = BucketedImages(config.input, multiple=multiple)
         if dist_info.is_main:
@@ -206,9 +208,6 @@ def main():
         )
         del resume_ckpt
 
-    total_steps = config.total_steps
-    if total_steps <= first_step:
-        raise ValueError(f"total_steps={total_steps} must exceed resumed step={first_step}.")
     grad_accum = config.grad_accum_steps
     global_bs = config.input.batch_size
     if global_bs % dist_info.dp_world != 0:
@@ -217,6 +216,19 @@ def main():
     if per_rank_bs % grad_accum != 0:
         raise ValueError(f"per-rank batch size {per_rank_bs} must be divisible by grad_accum_steps {grad_accum}")
     micro_bs = per_rank_bs // grad_accum
+    sampler_steps_per_epoch = None
+    if bucketed:
+        sampler_steps_per_epoch = bucket_steps_per_epoch(train_ds.groups, global_bs)
+    configured_epochs = config.get("num_epochs", None) if bucketed else None
+    epoch_stop_active = configured_epochs is not None and args.total_steps is None
+    if epoch_stop_active:
+        if not isinstance(configured_epochs, int) or configured_epochs <= 0:
+            raise ValueError(f"num_epochs must be a positive integer, got {configured_epochs!r}.")
+        total_steps = configured_epochs * sampler_steps_per_epoch
+    else:
+        total_steps = config.total_steps
+    if total_steps is None or total_steps <= first_step:
+        raise ValueError(f"total_steps={total_steps} must exceed resumed step={first_step}.")
     if bucketed:
         train_iter = build_bucket_iterator(train_ds, config.input, tokenizer, token_len, dist_info,
                                            total_steps, first_step, config.seed)
@@ -225,11 +237,34 @@ def main():
     if use_wandb:
         import wandb
         wandb.init(project=str(config.wandb.project), name=str(config.wandb.experiment))
-        wandb.config.update(dict(total_steps=total_steps, global_bs=global_bs))
+        wandb.config.update(dict(
+            total_steps=total_steps,
+            configured_epochs=(configured_epochs if epoch_stop_active else None),
+            sampler_steps_per_epoch=sampler_steps_per_epoch,
+            global_bs=global_bs,
+            per_rank_bs=per_rank_bs,
+            micro_bs_per_rank=micro_bs,
+            grad_accum=grad_accum,
+            data_parallel_world_size=dist_info.dp_world,
+            fsdp_size=dist_info.fsdp_size,
+            tensor_parallel_size=dist_info.model_size,
+            learning_rate=float(config.lr),
+            image_size=int(config.image_size),
+            token_len=int(token_len),
+            ema_decay_rate=float(config.ema_decay_rate),
+            train_timestep_shift=float(config.transport.train_timestep_shift),
+            log_every=int(config.log_training_steps),
+            ckpt_steps=int(config.ckpt_steps),
+            keep_ckpt_steps=int(config.get("keep_ckpt_steps", 0) or 0),
+            seed=int(config.seed),
+        ))
 
     if dist_info.is_main:
         log(f"training for {total_steps} steps | global_bs={global_bs} "
             f"micro_bs/rank={micro_bs} grad_accum={grad_accum}")
+        if sampler_steps_per_epoch is not None:
+            log(f"epoch-aware bucket sampler: {sampler_steps_per_epoch} steps/epoch | "
+                f"target={total_steps / sampler_steps_per_epoch:.3f} epochs")
 
     model.train()
     t_start = time.time()

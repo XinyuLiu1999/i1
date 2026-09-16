@@ -20,15 +20,27 @@ nvidia-smi
 nvidia-smi topo -m
 cc --version
 
-python3.11 -m venv ~/envs/i1_sft
-source ~/envs/i1_sft/bin/activate
+conda create -n i1_sft python=3.11 -y
+conda activate i1_sft
+python --version
+which python
 python -m pip install --upgrade pip
 ```
 
-The host needs an NVIDIA driver compatible with the selected CUDA wheel, Python
-3.11 with `venv` support, and a working C/C++ compiler for `torch.compile`. If using
-Conda instead, replace the two `venv` commands with
-`conda create -n i1_sft python=3.11 -y` and `conda activate i1_sft`.
+Use Conda to install Python 3.11 into this environment; a system-wide `python3.11`
+installation is not required. The commands work from the existing `(base)` shell;
+there is no need to deactivate it first. If you already deactivated `base` and
+`python` is no longer found, run the same Conda commands above. Python can exist
+only inside Conda environments on this node.
+
+After activation, `python --version` should report 3.11.x and `which python` should
+point into the `i1_sft` environment. If the environment already exists, skip
+`conda create` and activate it. Do not also create a `venv` or use
+`source ~/envs/i1_sft/bin/activate`; those belong to a different setup method.
+Keep `i1_sft` activated for every installation and training command below.
+
+The host also needs an NVIDIA driver compatible with the selected CUDA wheel and
+a working C/C++ compiler for `torch.compile`.
 The topology output should show the expected NVLink connections. In a container,
 make all eight allocated GPUs visible and provide enough shared memory for the
 data-loader workers.
@@ -194,8 +206,8 @@ cd torch_train
 ```
 
 Create `/path/to/experiment` first and replace all placeholder paths. The training
-and caption-audit commands below run from `i1/torch_train`. On later logins,
-reactivate the environment and restore the cache variables before running them.
+and caption-audit commands below run from `i1/torch_train`. On later logins, run
+`conda activate i1_sft` and restore the cache variables before running them.
 
 ## Data
 

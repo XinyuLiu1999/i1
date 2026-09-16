@@ -78,8 +78,12 @@ def load_tp_batch(train_iter, dist_info, batch_specs, device):
     for key, shape, dtype in batch_specs:
         if is_leader:
             t = batch[key].to(device=device, dtype=dtype).contiguous()
-        else:
-            t = torch.empty(shape, dtype=dtype, device=device)
+        # Broadcast dimensions before allocating the tensor on TP followers.
+        # The rank is fixed by the batch schema; spatial sizes may vary per step.
+        dimensions = torch.tensor(t.shape if is_leader else [0] * len(shape), device=device, dtype=torch.long)
+        dist.broadcast(dimensions, src=src, group=dist_info.tp_group)
+        if not is_leader:
+            t = torch.empty(tuple(dimensions.tolist()), dtype=dtype, device=device)
         dist.broadcast(t, src=src, group=dist_info.tp_group)
         out[key] = t
     return out
@@ -91,9 +95,9 @@ def _all_blocks(model):
     return list(model.blocks)
 
 
-def compile_blocks(model):
+def compile_blocks(model, dynamic=False):
     for block in _all_blocks(model):
-        block.compile()
+        block.compile(dynamic=True if dynamic else None)
     return model
 
 

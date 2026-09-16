@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from text_encoder.text_encoder import TextEncoder, encode_text_encoder
-from datasets import input_pipeline
 from diffusion import rectified_flow
 from models.dit import build_dit_model
 from training import checkpoint as ckpt_lib
@@ -43,6 +42,8 @@ def checkpoint_config(config, latent_size, text_embed_dim, text_num_tokens):
         text_embed_dim=text_embed_dim,
         text_num_tokens=text_num_tokens,
         rope_theta=mk.get("rope_theta", 10000.0),
+        position_scale="area",
+        training_buckets=config.input.get("buckets", None),
     )
 
 
@@ -62,7 +63,11 @@ def main():
     parser.add_argument("--keep_ckpt_steps", type=int, default=None, help="Override config.keep_ckpt_steps.")
     parser.add_argument("--data_dir", default=None, help="Override the dataset dir (single source, weight 1.0).")
     parser.add_argument("--no_amp", action="store_true", help="Disable bf16 mixed precision (train in fp32).")
-    parser.add_argument("--resume", default=None, help="Checkpoint path to resume/fine-tune from (overrides config.resume).")
+    checkpoints = parser.add_mutually_exclusive_group()
+    checkpoints.add_argument("--resume", default=None, help="Resume a training checkpoint, including optimizer and step.")
+    checkpoints.add_argument("--init_from", default=None, help="Initialize fresh SFT from model/EMA weights only.")
+    parser.add_argument("--manifest", default=None, help="JSONL image/caption manifest for bucketed SFT.")
+    parser.add_argument("--token_len", type=int, default=None, help="Maximum caption tokens for a new training run.")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -87,9 +92,20 @@ def main():
     if args.keep_ckpt_steps is not None:
         config.keep_ckpt_steps = args.keep_ckpt_steps
     if args.data_dir is not None:
+        if config.input.get("type") == "bucketed":
+            raise ValueError("Use --manifest for bucketed SFT; --data_dir is for TFRecords.")
         config.input.data = [(dict(split="train", data_dir=args.data_dir), 1.0)]
     if args.resume is not None:
         config.resume = args.resume
+    if args.init_from is not None:
+        config.init_from = args.init_from
+        config.resume = ""
+    if args.manifest is not None:
+        if config.input.get("type") != "bucketed":
+            raise ValueError("--manifest requires a bucketed SFT config.")
+        config.input.manifest = args.manifest
+    if args.token_len is not None:
+        config.token_len = args.token_len
     if args.no_amp:
         config.amp = False
     amp = config.get("amp", True)
@@ -108,10 +124,24 @@ def main():
     if args.workdir and dist_info.is_main:
         os.makedirs(args.workdir, exist_ok=True)
     save_ckpt_path = os.path.join(args.workdir, "checkpoint.pt") if args.workdir else None
+    resume_path = ckpt_lib.resolve_resume_path(save_ckpt_path, config)
+    if not resume_path and config.get("init_from") and not os.path.isfile(config.init_from):
+        raise FileNotFoundError(f"SFT initialization checkpoint does not exist: {config.init_from}")
+    if config.input.get("type") == "bucketed" and not resume_path and not config.get("init_from"):
+        raise ValueError("Bucketed SFT requires --init_from or --resume (or a checkpoint in workdir).")
 
-    train_ds, ntrain = input_pipeline.build_training_dataset(
-        config.input, process_index=dist_info.dp_rank, process_count=dist_info.dp_world
-    )
+    bucketed = config.input.get("type", "tfrecord") == "bucketed"
+    if bucketed:
+        from datasets.bucketed import BucketedImages, build_bucket_iterator
+        multiple = VAE_CONFIGS[config.vae_type]["vae_compression_factor"] * config.patch_size
+        train_ds = BucketedImages(config.input, multiple=multiple)
+        if dist_info.is_main:
+            log(f"SFT images: {len(train_ds)}; bucket counts: "
+                f"{dict(zip(train_ds.buckets, map(len, train_ds.groups)))}; filtered: {dict(train_ds.filtered)}")
+    else:
+        from datasets import input_pipeline
+        train_ds, _ = input_pipeline.build_training_dataset(
+            config.input, process_index=dist_info.dp_rank, process_count=dist_info.dp_world)
 
     text_encoder_bundle = TextEncoder(
         config, config.text_encoder_type, config.token_len,
@@ -122,7 +152,8 @@ def main():
     token_len = text_encoder_bundle.text_token_len
     text_embed_dim = text_encoder_bundle.hidden_dim
 
-    train_iter = input_pipeline.start_input_iterator(train_ds, tokenizer, token_len)
+    if not bucketed:
+        train_iter = input_pipeline.start_input_iterator(train_ds, tokenizer, token_len)
 
     vae = load_vae(config, device, dtype=torch.float32)
     vae_channels = VAE_CONFIGS[config.vae_type]["vae_channels"]
@@ -137,18 +168,26 @@ def main():
     ckpt_cfg = checkpoint_config(config, latent_size, text_embed_dim, token_len)
 
     resume_ckpt = None
-    resume_path = ckpt_lib.resolve_resume_path(save_ckpt_path, config)
     if resume_path:
         if dist_info.is_main:
             log(f"resuming from {resume_path}")
         resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
         ckpt_lib.load_model_weights(model, resume_ckpt, dist_info)
+    elif config.get("init_from"):
+        init_ckpt = torch.load(config.init_from, map_location="cpu", weights_only=False)
+        ckpt_lib.load_model_weights(model, init_ckpt, dist_info, initialize=True)
+        del init_ckpt
+        if dist_info.is_main:
+            log(f"Initialized SFT from {config.init_from}; optimizer, EMA and step start fresh")
+    elif bucketed:
+        raise ValueError("Bucketed SFT requires --init_from or --resume (or a checkpoint in workdir).")
 
     if dist_info.is_main:
         n_params = sum(p.numel() for p in model.parameters())
         log(f"model params: {n_params/1e6:.1f}M | latent {vae_channels}x{latent_size}x{latent_size}")
 
-    compile_blocks(model)
+    if config.get("compile", True):
+        compile_blocks(model, dynamic=bucketed)
     model = parallelize(model, dist_info)
 
     rf_cfg = rectified_flow.RectifiedFlowConfig.from_config(config.transport)
@@ -168,6 +207,8 @@ def main():
         del resume_ckpt
 
     total_steps = config.total_steps
+    if total_steps <= first_step:
+        raise ValueError(f"total_steps={total_steps} must exceed resumed step={first_step}.")
     grad_accum = config.grad_accum_steps
     global_bs = config.input.batch_size
     if global_bs % dist_info.dp_world != 0:
@@ -176,6 +217,9 @@ def main():
     if per_rank_bs % grad_accum != 0:
         raise ValueError(f"per-rank batch size {per_rank_bs} must be divisible by grad_accum_steps {grad_accum}")
     micro_bs = per_rank_bs // grad_accum
+    if bucketed:
+        train_iter = build_bucket_iterator(train_ds, config.input, tokenizer, token_len, dist_info,
+                                           total_steps, first_step, config.seed)
 
     use_wandb = bool(config.wandb.log_wandb) and dist_info.is_main
     if use_wandb:
@@ -240,6 +284,9 @@ def main():
                 "l2_updates": optimizer.last_update_norm,
                 "l2_params": l2_params,
                 "l2_ema_params": l2_ema,
+                "image_height": batch["image"].shape[1],
+                "image_width": batch["image"].shape[2],
+                "caption_tokens_mean": batch["attention_mask"].float().sum(dim=1).mean().item(),
             }
             if dist_info.is_main:
                 imgs_per_s = config.log_training_steps * global_bs / (time.time() - t_start)

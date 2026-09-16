@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
+from .geometry import VariableGeometryMixin
+
 
 @dataclasses.dataclass
 class DualStreamDiTConfig:
@@ -465,7 +467,7 @@ class FinalLayerNoAdaLN(nn.Module):
         return self.linear(self.norm_final(x))
 
 
-class i1DiT(nn.Module):
+class i1DiT(VariableGeometryMixin, nn.Module):
     def __init__(self, config: DualStreamDiTConfig) -> None:
         super().__init__()
         cfg = config
@@ -511,6 +513,7 @@ class i1DiT(nn.Module):
         self.rope_embedder = MultimodalRopeEmbedder(
             axes_dims, axes_lens, (1.0, image_scale, image_scale), theta=cfg.rope_theta
         )
+        self.init_geometry(cfg.image_resolution, cfg.hidden_size, axes_dims, cfg.rope_theta)
         self.register_buffer("image_row_ids", torch.repeat_interleave(torch.arange(hw), hw), persistent=False)
         self.register_buffer("image_col_ids", torch.tile(torch.arange(hw), (hw,)), persistent=False)
 
@@ -566,31 +569,6 @@ class i1DiT(nn.Module):
         in_channels = self.text_encoder_adapter.learnable_null_caption.shape[-1]
         nn.init.normal_(self.text_encoder_adapter.learnable_null_caption, std=in_channels ** -0.5)
 
-    def _build_position_ids(self, text_mask: torch.Tensor, text_lengths: torch.Tensor, num_image_tokens: int) -> torch.Tensor:
-        bsz, text_len = text_mask.shape
-        caption_positions = torch.arange(text_len, dtype=torch.long, device=text_mask.device)[None].expand(bsz, text_len)
-        caption_positions = torch.where(text_mask.bool(), caption_positions, torch.zeros_like(caption_positions))
-        zeros = torch.zeros_like(caption_positions)
-        caption_ids = torch.stack((caption_positions, zeros, zeros), dim=-1)
-        row_ids = self.image_row_ids[:num_image_tokens][None].expand(bsz, num_image_tokens)
-        col_ids = self.image_col_ids[:num_image_tokens][None].expand(bsz, num_image_tokens)
-        image_time = text_lengths[:, None].expand(bsz, num_image_tokens)
-        image_ids = torch.stack((image_time, row_ids, col_ids), dim=-1)
-        return torch.cat([caption_ids, image_ids], dim=1)
-
-    def _rope_freqs(self, text_tokens: torch.Tensor, text_mask: Optional[torch.Tensor], num_image_tokens: int):
-        seq_text = text_tokens.shape[1]
-        pos_mask = (
-            text_mask if text_mask is not None
-            else torch.ones((text_tokens.shape[0], seq_text), dtype=torch.bool, device=text_tokens.device)
-        )
-        text_lengths = pos_mask.to(torch.int32).sum(dim=1)
-        position_ids = self._build_position_ids(pos_mask, text_lengths, num_image_tokens)
-        cos, sin = self.rope_embedder(position_ids)
-        text_freqs = (cos[:, :seq_text], sin[:, :seq_text])
-        image_freqs = (cos[:, seq_text:seq_text + num_image_tokens], sin[:, seq_text:seq_text + num_image_tokens])
-        return image_freqs, text_freqs
-
     def forward(
         self,
         x: torch.Tensor,
@@ -600,10 +578,12 @@ class i1DiT(nn.Module):
         train: bool = False,
     ) -> torch.Tensor:
         del t
-        tokens = self.x_embedder(x) + self.pos_embed.to(dtype=x.dtype)
+        h, w = self.patch_grid(x)
+        pos = self.grid_geometry(h, w, x.device)[0]
+        tokens = self.x_embedder(x) + pos.to(dtype=x.dtype)
         text_mask = mask.bool() if mask is not None else None
         text_tokens = self.text_encoder_adapter(caption, train=train)
-        image_freqs, text_freqs = self._rope_freqs(text_tokens, text_mask, tokens.shape[1])
+        image_freqs, text_freqs = self.grid_rope_freqs(text_tokens, text_mask, h, w)
 
         use_ckpt = self.use_grad_ckpt and train and torch.is_grad_enabled()
 
@@ -633,7 +613,6 @@ class i1DiT(nn.Module):
 
         tokens = self.final_layer(image_tokens)
         bsz = x.shape[0]
-        h = w = self.input_size // self.patch_size
         p = self.patch_size
         tokens = tokens.reshape(bsz, h, w, p, p, self.out_channels)
         tokens = tokens.permute(0, 1, 3, 2, 4, 5).reshape(bsz, h * p, w * p, self.out_channels)

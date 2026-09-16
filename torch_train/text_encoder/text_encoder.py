@@ -18,6 +18,8 @@ class TextEncoder:
         if text_encoder_type not in TEXT_ENCODER_CONFIGS:
             raise ValueError(f"Unsupported text encoder type: {text_encoder_type} (only T5Gemma).")
         spec = TEXT_ENCODER_CONFIGS[text_encoder_type]
+        if text_token_len is not None and text_token_len <= 0:
+            raise ValueError("text_token_len must be positive.")
         self.text_encoder_type = text_encoder_type
         self.model_name = spec["model_name"]
         self.hidden_dim = spec["hidden_dim"]
@@ -30,6 +32,9 @@ class TextEncoder:
         self.text_encoder = (
             T5GemmaModel.from_pretrained(self.model_name, dtype=weight_dtype).encoder.to(device).eval()
         )
+        max_context = getattr(self.text_encoder.config, "max_position_embeddings", None)
+        if max_context is not None and self.text_token_len > max_context:
+            raise ValueError(f"token_len={self.text_token_len} exceeds encoder context={max_context}.")
         for p in self.text_encoder.parameters():
             p.requires_grad_(False)
         print(f"Successfully loaded text encoder {text_encoder_type} and tokenizer.")

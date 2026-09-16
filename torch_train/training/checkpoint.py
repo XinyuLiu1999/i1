@@ -53,15 +53,28 @@ def resolve_resume_path(save_ckpt_path, config):
     if save_ckpt_path and os.path.exists(save_ckpt_path):
         return save_ckpt_path
     resume = config.get("resume", "")
-    if resume and os.path.exists(resume):
+    if resume:
+        if not os.path.isfile(resume):
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume}")
         return resume
     return None
 
 
-def load_model_weights(model, ckpt, dist_info):
+def load_model_weights(model, ckpt, dist_info, initialize=False):
     ts = ckpt.get("train_state", {})
-    raw = ts.get("model_raw", ckpt["model"])
+    raw = ckpt["model"] if initialize else ts.get("model_raw", ckpt["model"])
     filtered = {k: v for k, v in raw.items() if not _skip(k)}
+    # Fresh SFT starts from inference/EMA weights. Only the learned null-caption
+    # length changes; preserve its prefix and tile it to initialize extra slots.
+    name = "text_encoder_adapter.learnable_null_caption"
+    if initialize and name in filtered:
+        value = filtered[name]
+        target = model.state_dict()[name]
+        if value.shape != target.shape and value.shape[0] == target.shape[0] and value.shape[2] == target.shape[2]:
+            repeats = (target.shape[1] + value.shape[1] - 1) // value.shape[1]
+            filtered[name] = value.repeat(1, repeats, 1)[:, :target.shape[1]].clone()
+            if dist_info.is_main:
+                log(f"SFT initialization: null caption {value.shape[1]} -> {target.shape[1]} tokens (tiled prefix)")
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     missing = [m for m in missing if not _skip(m)]
     if missing or unexpected:
@@ -76,6 +89,8 @@ def load_train_states(ema, optimizer, ckpt, dist_info, permuted_keys=None):
     tp = dist_info.model_size
     permuted = permuted_keys or set()
     ts = ckpt.get("train_state", {})
+    if "opt" not in ts:
+        raise ValueError("Checkpoint has no optimizer state. Use --init_from for a fresh SFT run, not --resume.")
     if ema is not None and "model_raw" in ts:
         ema_src = ckpt["model"]
         for name in list(ema.shadow.keys()):

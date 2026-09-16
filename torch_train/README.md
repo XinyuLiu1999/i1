@@ -2,6 +2,9 @@
 
 This folder contains the PyTorch reimplementation of the i1 model training code.
 
+For checkpoint-initialized SFT with rectangular image buckets and long captions,
+see [the SFT guide](SFT.md) and `configs/sft_512.py` / `configs/sft_1024.py`.
+
 ## 1. Environment Setup
 ```bash
 python -m venv ~/envs/i1_torch_train

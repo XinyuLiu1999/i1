@@ -4,5 +4,6 @@
 **/*.png
 **/*.pdf
 **/*.out
+**/wandb/
 !docs/static/**/*.jpg
 !docs/static/**/*.png

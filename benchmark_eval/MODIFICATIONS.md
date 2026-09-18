@@ -44,3 +44,15 @@ We modify the metadata loading code so that the metadata files do not have to be
 ## CVTG-2K
 The core evaluation code is [unified_metrics_eval.py](cvtg-2k/unified_metrics_eval.py).<br>
 We keep it intact.
+
+## BizGenEval
+The core evaluator remains in the sibling `BizGenEval` checkout and is invoked
+without modification. The integration scripts in [bizgeneval](bizgeneval)
+prepare filenames expected by the official evaluator, select the closest native
+i1 SFT aspect-ratio bucket for each SFT prompt, run the starting checkpoint at
+1024x1024, invoke the official evaluation and summary modules, and compare their
+summary CSVs. The SFT checkpoint is generated before the starting checkpoint.
+
+The PyTorch inference entry point accepts optional per-prompt height and width
+fields from JSONL so all aspect ratios can be generated in one model-loading
+session per GPU worker.

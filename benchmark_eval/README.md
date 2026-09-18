@@ -150,3 +150,13 @@ python process.py --root $CVTG_IMAGES
 
 python unified_metrics_eval.py --benchmark_dir prompts --result_dir $CVTG_IMAGES --output_file $CVTG_IMAGES/results.json --cache_dir /path/to/huggingface/cache --no_hf_mirror
 ```
+
+## 6. [BizGenEval](https://github.com/microsoft/BizGenEval)
+
+The repository includes a resumable generation, Gemini evaluation, summary,
+and checkpoint-comparison pipeline for the local BizGenEval checkout. It is
+preconfigured to compare the i1 starting checkpoint with
+`artifacts/sft_1024_full_20260917_094936/checkpoint.pt-000006262`.
+
+See [bizgeneval/README.md](bizgeneval/README.md) for setup, full evaluation,
+smoke-test, and output instructions.

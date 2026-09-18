@@ -48,8 +48,16 @@ def _parquet_reader(path):
 
 @lru_cache(maxsize=1)
 def _parquet_group(path, row_group):
-    # Sequential preprocessing consumes both images without reading the group twice.
-    return _parquet_reader(path).read_row_group(row_group, columns=["id", "prompt", "image_bytes"])
+    # Sequential preprocessing consumes nearby images without reading the group twice.
+    parquet = _parquet_reader(path)
+    names = set(parquet.schema_arrow.names)
+    if {"id", "prompt", "image_bytes"}.issubset(names):
+        columns = ["id", "prompt", "image_bytes"]
+    elif {"id", "caption", "image_bytes"}.issubset(names):
+        columns = ["id", "caption", "image_bytes"]
+    else:
+        raise ValueError(f"Unsupported image Parquet schema at {path}")
+    return parquet.read_row_group(row_group, columns=columns)
 
 
 def parquet_files(source):
@@ -202,8 +210,9 @@ def open_record_image(record):
     else:
         row = _parquet_group(record.parquet_path, record.row_group)
         index = record.row_in_group
+        caption_column = "prompt" if "prompt" in row.column_names else "caption"
         if (str(row["id"][index].as_py()) != record.identifier
-                or row["prompt"][index].as_py() != record.caption):
+                or row[caption_column][index].as_py() != record.caption):
             raise ValueError(f"Stale Parquet reference or caption for {record.identifier}; rebuild the index.")
         source = Image.open(BytesIO(row["image_bytes"][index].as_py()))
     try:

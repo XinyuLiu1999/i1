@@ -255,6 +255,44 @@ split, run the VAE diagnostic, or run any GPU training.
 already successful full decode. The pipeline itself starts with index construction
 when relaunched normally; the pixel exporter can reuse verified completed parts.
 
+For the production unified-caption export, use the fused caption/image audit instead of
+the GPT-Image-specific corrected-index pipeline:
+
+```bash
+cd /cephfs/liuxinyu/DenseText-Project/local_captioning
+python run_unified_cpu.py --cache-workers 8
+```
+
+That command first performs the resumable captioned-Parquet export to NFS, then invokes
+the fused audit/cache pass below in the `i1_sft` environment. To recover or rerun only the
+second phase after a completed export, invoke it directly:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+HF_HUB_CACHE=/cephfs/liuxinyu/.cache/data_juicer/models \
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+python -m datasets.precompute_captioned \
+  --source /nfs_yaoyuan/liuxinyu/textdense_primary_english_captioned_v4 \
+  --output-dir /cephfs/liuxinyu/DenseText-Project/artifacts/\
+textdense_primary_english_captioned_v4_precompute/cache_1024 \
+  --resolution 1024 --workers 8 --token-limit 1024
+```
+
+Train this cache with `configs/sft_1024_captioned.py`. Its 45-shape, native-32px
+frontier is deliberately separate from `sft_1024.py`, preserving compatibility with the
+existing GPT-Image-200K cache's 25-shape transform fingerprint.
+
+This pass writes only accepted records to `cache.jsonl`. Acceptance requires an `ok`
+caption status, a nonempty caption no longer than 1,024 T5Gemma tokens, a decodable image,
+matching EXIF-oriented declared dimensions, at most 4,096 pixels on either side and at
+most 4,096² source pixels, and an eligible training bucket. The size limits are checked
+before full image decoding and can be overridden with `--max-source-side` and
+`--max-source-pixels`. All failures are retained in `rejected.jsonl` with reason codes.
+`bucket_plan.json` is a metadata-only
+coverage/storage report generated before transformation; `summary.json` records final
+accepted counts, token distribution, buckets, padding, and checksums. Completed parts are
+checksum-validated and reused on restart.
+
 ```bash
 # a. Decode all original images and repair their dimension metadata.
 python -m datasets.build_image_index \

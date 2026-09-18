@@ -17,4 +17,7 @@ def get_config():
     config.input.buckets = [(h * 2, w * 2) for h, w in config.input.buckets]
     config.input.min_image_area = 1024 * 1024
     config.transport.train_timestep_shift = 0.3
+    config.wandb.log_wandb = True
+    config.wandb.project = "DenseText-SFT"
+    config.wandb.experiment = "i1-1024-full"
     return config

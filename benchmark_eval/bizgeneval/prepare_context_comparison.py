@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--count", type=int, default=107)
     parser.add_argument("--threshold", type=int, default=1024)
     parser.add_argument("--tokenizer", default="google/t5gemma-2b-2b-ul2-it")
     parser.add_argument(

@@ -67,7 +67,7 @@ because preparation intentionally rewrites the selected dataset manifest.
 
 ### Compare 1,024-token truncation with all input tokens
 
-`run_context_comparison.sh` selects 100 prompts whose untruncated T5Gemma
+`run_context_comparison.sh` selects all 107 prompts whose untruncated T5Gemma
 length exceeds 1,024 tokens and generates them twice with the SFT checkpoint.
 The first arm truncates at 1,024. The second expands the model context to the
 longest selected prompt and sets caption overflow to `error`, ensuring that it
@@ -79,14 +79,14 @@ GPU_IDS=0,1,2,3,4,5,6,7 ./run_context_comparison.sh
 
 The two arms use the same prompt order, aspect-ratio buckets, GPU partition,
 seeds, and inference settings. Outputs are written by default to
-`artifacts/bizgeneval_sft_context_comparison_100`, including a side-by-side
+`artifacts/bizgeneval_sft_context_comparison_107`, including a side-by-side
 `comparison.html` viewer and `inputs/token_lengths.tsv`. The all-token arm is
 an inference-time context extension beyond the checkpoint's trained 1,024-token
 context, so it measures extrapolation rather than a natively long-context SFT.
 
 Use `PREPARE_ONLY=1` to inspect the selected prompts without starting GPU work,
-or `SELECTION=longest` to choose the 100 longest qualifying prompts instead of
-the first 100 in dataset order.
+or override `PROMPT_COUNT` to run a smaller subset. With the default count of
+107, `SELECTION` has no effect because every qualifying prompt is included.
 
 ## 3. Install the official evaluator
 

@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd -- "$I1_ROOT/.." && pwd)"
 BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-/cephfs/liuxinyu/BizGenEval}"
 DATA_PATH="${DATA_PATH:-$BIZGENEVAL_ROOT/assets/bizgeneval.jsonl}"
 SFT_CHECKPOINT="${SFT_CHECKPOINT:-$PROJECT_ROOT/artifacts/sft_1024_full_20260917_094936/checkpoint.pt-000006262}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_sft_context_comparison_100}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_sft_context_comparison_107}"
 
 DEFAULT_PYTHON="/root/miniconda3/envs/i1_sft/bin/python"
 if [[ ! -x "$DEFAULT_PYTHON" ]]; then
@@ -18,7 +18,7 @@ PYTHON_BIN="${GENERATION_PYTHON:-$DEFAULT_PYTHON}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 GPU_LAUNCH_DELAY="${GPU_LAUNCH_DELAY:-10}"
-PROMPT_COUNT="${PROMPT_COUNT:-100}"
+PROMPT_COUNT="${PROMPT_COUNT:-107}"
 TOKEN_THRESHOLD="${TOKEN_THRESHOLD:-1024}"
 SELECTION="${SELECTION:-dataset-order}"
 NUM_STEPS="${NUM_STEPS:-250}"

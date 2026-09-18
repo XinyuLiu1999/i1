@@ -590,6 +590,19 @@ def prompts_from_args(args) -> list[str]:
     if args.prompts_file:
         with open(os.path.expanduser(args.prompts_file), "r", encoding="utf-8") as handle:
             prompts.extend(line.strip() for line in handle if line.strip())
+    elif args.prompts_jsonl:
+        with open(os.path.expanduser(args.prompts_jsonl), "r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                prompt = row.get(args.jsonl_prompt_key)
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise ValueError(
+                        f"{args.prompts_jsonl}:{line_number} has no non-empty "
+                        f"{args.jsonl_prompt_key!r} string."
+                    )
+                prompts.append(prompt.strip())
     elif args.prompt_set == "geneval":
         with open(_prompt_path("geneval.jsonl")) as fp:
             metadatas = [json.loads(line) for line in fp]
@@ -746,14 +759,14 @@ def prepare_cfg_conditioning(model, text: torch.Tensor, mask: torch.Tensor):
     return torch.cat([text, uncond], dim=0), torch.cat([mask, uncond_mask], dim=0)
 
 
-def denoise_latents(model, text, mask, args, device):
-    height = getattr(args, "height", None) or model.image_resolution
-    width = getattr(args, "width", None) or model.image_resolution
+def denoise_latents(model, text, mask, args, device, generator=None, height=None, width=None):
+    height = height or getattr(args, "height", None) or model.image_resolution
+    width = width or getattr(args, "width", None) or model.image_resolution
     multiple = 8 * model.patch_size
     if height <= 0 or width <= 0 or height % multiple or width % multiple:
         raise ValueError(f"Image height and width must be positive multiples of {multiple}.")
     shape = (text.shape[0], model.in_channels, height // 8, width // 8)
-    gen = torch.Generator(device=device)
+    gen = generator if generator is not None else torch.Generator(device=device)
     latents = torch.randn(shape, generator=gen, device=device, dtype=torch.bfloat16)
     text = text.to(dtype=torch.bfloat16)
 
@@ -807,11 +820,115 @@ def decode_vae(vae, latents: torch.Tensor, batch_size: int):
     return np.concatenate(images, axis=0)
 
 
-def build_model(device, checkpoint_path: str, dtype=torch.bfloat16):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model = i1DiT(**checkpoint["config"]).to(device=device, dtype=dtype).eval()
-    model.load_state_dict(checkpoint["model"], strict=True)
+def build_model(device, checkpoint_path: str, dtype=torch.bfloat16, text_num_tokens: int | None = None):
+    # mmap avoids materializing the checkpoint's optimizer/train state in host
+    # RAM when an SFT checkpoint also contains resumable training state.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+    config = dict(checkpoint["config"])
+    checkpoint_text_num_tokens = int(config.get("text_num_tokens", 256))
+    if text_num_tokens is not None:
+        if text_num_tokens <= 0:
+            raise ValueError("text_num_tokens must be positive.")
+        if text_num_tokens < checkpoint_text_num_tokens:
+            raise ValueError(
+                f"text_num_tokens={text_num_tokens} is smaller than the checkpoint's "
+                f"native context ({checkpoint_text_num_tokens})."
+            )
+        config["text_num_tokens"] = text_num_tokens
+
+    model = i1DiT(**config).to(device=device, dtype=dtype).eval()
+    model.checkpoint_text_num_tokens = checkpoint_text_num_tokens
+    state = checkpoint["model"]
+    if text_num_tokens is None or text_num_tokens == checkpoint_text_num_tokens:
+        model.load_state_dict(state, strict=True)
+        return model
+
+    # Match the SFT initialization compatibility path: rebuild deterministic
+    # geometry tensors and tile the learned null-caption prefix to the new
+    # token length. All other learned weights load unchanged.
+    filtered = {
+        name: value
+        for name, value in state.items()
+        if "pos_embed" not in name and "rope_embedder" not in name
+    }
+    null_name = "text_encoder_adapter.learnable_null_caption"
+    source_null = filtered[null_name]
+    target_null = model.state_dict()[null_name]
+    if source_null.shape != target_null.shape:
+        if source_null.shape[0] != target_null.shape[0] or source_null.shape[2] != target_null.shape[2]:
+            raise ValueError(
+                f"Cannot resize null caption from {tuple(source_null.shape)} "
+                f"to {tuple(target_null.shape)}."
+            )
+        repeats = (target_null.shape[1] + source_null.shape[1] - 1) // source_null.shape[1]
+        filtered[null_name] = source_null.repeat(1, repeats, 1)[:, : target_null.shape[1]].clone()
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    unexpected = list(unexpected)
+    disallowed_missing = [
+        name for name in missing if "pos_embed" not in name and "rope_embedder" not in name
+    ]
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            f"Extended checkpoint mismatch: missing={disallowed_missing[:8]} "
+            f"unexpected={unexpected[:8]}"
+        )
+    print(
+        f"Extended checkpoint text context: {checkpoint_text_num_tokens} -> "
+        f"{text_num_tokens} tokens (tiled null caption; rebuilt RoPE)."
+    )
     return model
+
+
+def select_text_context_length(tokenizer, prompts: list[str], model, dynamic: bool) -> int:
+    """Choose either the checkpoint-native context or the configured maximum."""
+    maximum = model.text_num_tokens
+    native = getattr(model, "checkpoint_text_num_tokens", maximum)
+    if not dynamic or native >= maximum:
+        return maximum
+    raw_lengths = [
+        len(token_ids)
+        for token_ids in tokenizer(
+            prompts,
+            truncation=False,
+            padding=False,
+            add_special_tokens=True,
+        )["input_ids"]
+    ]
+    return native if max(raw_lengths, default=0) <= native else maximum
+
+
+def jsonl_image_sizes(
+    path: str,
+    height_key: str | None,
+    width_key: str | None,
+) -> list[tuple[int, int]] | None:
+    """Read optional per-prompt image sizes prepared by benchmark pipelines."""
+    if height_key is None and width_key is None:
+        return None
+    if not height_key or not width_key:
+        raise ValueError("--jsonl-height-key and --jsonl-width-key must be set together.")
+
+    sizes = []
+    with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            try:
+                height = int(row[height_key])
+                width = int(row[width_key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path}:{line_number} must contain positive integer fields "
+                    f"{height_key!r} and {width_key!r}."
+                ) from exc
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    f"{path}:{line_number} has invalid image size {height}x{width}."
+                )
+            sizes.append((height, width))
+    return sizes
 
 
 def str2bool(v):
@@ -832,12 +949,24 @@ def str2bool(v):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", default="samples")
+    parser.add_argument("--skip-existing", action="store_true", help="Resume without regenerating existing PNG files.")
     parser.add_argument("--checkpoint", help="Local original or SFT checkpoint; otherwise download the selected release.")
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--caption-overflow", choices=("error", "truncate"), default="error")
+    parser.add_argument("--text-num-tokens", type=int, default=None, help="Override checkpoint text context length.")
+    parser.add_argument(
+        "--dynamic-text-context",
+        action="store_true",
+        help="Use the checkpoint's native context for short prompts and the override for longer prompts.",
+    )
     parser.add_argument("--prompt", action="append")
     parser.add_argument("--prompts-file")
+    parser.add_argument("--prompts-jsonl", help="JSONL prompts; reads the field selected by --jsonl-prompt-key.")
+    parser.add_argument("--jsonl-prompt-key", default="prompt")
+    parser.add_argument("--jsonl-height-key", help="Optional JSONL field containing each prompt's image height.")
+    parser.add_argument("--jsonl-width-key", help="Optional JSONL field containing each prompt's image width.")
+    parser.add_argument("--output-names-file", help="Optional line-delimited output filenames matching the prompts.")
     parser.add_argument("--prompt-set", type=str, choices=PROMPT_SET_CHOICES)
     parser.add_argument("--rewrite-batch-size", type=int, default=1)
     parser.add_argument("--diffusion-batch-size", type=int, default=1)
@@ -849,6 +978,7 @@ if __name__ == "__main__":
     parser.add_argument("--rewriter-model", default="Qwen/Qwen3-30B-A3B", choices=["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-4B-Instruct-2507"])
     parser.add_argument("--vae-batch-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=None, help="Seed for the initial diffusion latents.")
     parser.add_argument("--model-size", choices=tuple(MODEL_SIZE_TO_REPO_ID), default="3B")
     parser.add_argument("--resolution", type=int, choices=(256, 512, 1024), default=1024)
     parser.add_argument("--start-idx", type=int, default=None)
@@ -863,18 +993,85 @@ if __name__ == "__main__":
     os.makedirs(args.outdir, exist_ok=True)
 
     prompts = prompts_from_args(args)
+    image_sizes = None
+    if args.jsonl_height_key or args.jsonl_width_key:
+        if not args.prompts_jsonl:
+            raise ValueError("Per-prompt image sizes require --prompts-jsonl.")
+        if args.prompt:
+            raise ValueError("Do not combine --prompt with per-prompt JSONL image sizes.")
+        image_sizes = jsonl_image_sizes(
+            args.prompts_jsonl,
+            args.jsonl_height_key,
+            args.jsonl_width_key,
+        )
+        if len(image_sizes) != len(prompts):
+            raise ValueError(
+                f"Expected one image size per prompt ({len(prompts)}), got {len(image_sizes)}."
+            )
     if args.rewrite_prompt:
         prompts = rewrite_prompts(prompts, device, args.rewriter_model, args.rewrite_batch_size)
         print(prompts)
     if args.prompt_set is not None:
         if ("geneval" in args.prompt_set) or ("dpg" in args.prompt_set) or ("longtext" in args.prompt_set):
             prompts = [item for item in prompts for _ in range(4)]
+    output_names = None
+    if args.output_names_file:
+        with open(os.path.expanduser(args.output_names_file), "r", encoding="utf-8") as handle:
+            output_names = [line.strip() for line in handle if line.strip()]
+        if len(output_names) != len(prompts):
+            raise ValueError(
+                f"Expected one output name per prompt ({len(prompts)}), got {len(output_names)}."
+            )
+        if len(set(output_names)) != len(output_names):
+            raise ValueError("Output names must be unique.")
+        for name in output_names:
+            if Path(name).name != name or not name.lower().endswith(".png"):
+                raise ValueError(f"Output names must be PNG basenames, got: {name!r}")
+
+    def output_path(image_index: int) -> str:
+        if output_names is not None:
+            return os.path.join(args.outdir, output_names[image_index])
+        if args.prompt_set is not None and (("geneval" in args.prompt_set) or ("dpg" in args.prompt_set)):
+            prompt_index, repeat_index = divmod(image_index, 4)
+            return os.path.join(args.outdir, f"{prompt_index:05d}", "samples", f"{repeat_index:05d}.png")
+        if args.prompt_set is not None and (("prism" in args.prompt_set) or ("CVTG-2K" in args.prompt_set)):
+            return os.path.join(args.outdir, f"{image_index:05d}.png")
+        if args.prompt_set is not None and "longtext" in args.prompt_set:
+            prompt_index, repeat_index = divmod(image_index, 4)
+            return os.path.join(args.outdir, f"{prompt_index:04d}_{repeat_index}.png")
+        return os.path.join(args.outdir, f"{image_index:06d}.png")
+
+    def output_exists(image_index: int) -> bool:
+        """Treat a PNG with the wrong requested geometry as incomplete."""
+        path = output_path(image_index)
+        if not os.path.isfile(path):
+            return False
+        expected = None
+        if image_sizes is not None:
+            height, width = image_sizes[image_index]
+            expected = (width, height)
+        elif args.height is not None and args.width is not None:
+            expected = (args.width, args.height)
+        if expected is None:
+            return True
+        try:
+            with Image.open(path) as existing_image:
+                return existing_image.size == expected
+        except (OSError, ValueError):
+            return False
+
+    start_idx = max(0, args.start_idx) if args.start_idx is not None else 0
+    end_idx = min(len(prompts), args.end_idx) if args.end_idx is not None else len(prompts)
+    if args.skip_existing and all(output_exists(index) for index in range(start_idx, end_idx)):
+        print(f"Skipping sample indices [{start_idx}, {end_idx}): all output files already exist.")
+        sys.exit(0)
+
     checkpoint_path = args.checkpoint or hf_hub_download(
         repo_id=MODEL_SIZE_TO_REPO_ID[args.model_size],
         filename=f"{args.resolution}_resolution_checkpoint_torch.pt",
         repo_type="model",
     )
-    model = build_model(device, checkpoint_path)
+    model = build_model(device, checkpoint_path, text_num_tokens=args.text_num_tokens)
 
     tokenizer = AutoTokenizer.from_pretrained("google/t5gemma-2b-2b-ul2-it")
     text_encoder = T5GemmaModel.from_pretrained(
@@ -883,32 +1080,83 @@ if __name__ == "__main__":
     ).encoder.to(device).eval()
     vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.2-dev", subfolder="vae").to(device=device, dtype=torch.bfloat16).eval()
 
-    start_idx = max(0, args.start_idx) if args.start_idx is not None else 0
-    end_idx = min(len(prompts), args.end_idx) if args.end_idx is not None else len(prompts)
+    latent_generator = None
+    if args.seed is not None:
+        latent_generator = torch.Generator(device=device).manual_seed(args.seed)
+    reported_text_lengths = set()
     with torch.inference_mode():
-        for start in range(start_idx, end_idx, args.diffusion_batch_size):
-            batch_prompts = prompts[start : min(start + args.diffusion_batch_size, end_idx)]
-            text, mask = encode_prompt(tokenizer, text_encoder, batch_prompts, device,
-                                       model.text_num_tokens, args.caption_overflow)
-            latents = denoise_latents(model, text, mask, args, device)
+        start = start_idx
+        while start < end_idx:
+            batch_end = min(start + args.diffusion_batch_size, end_idx)
+            if image_sizes is not None:
+                # A tensor batch must share one spatial shape. Shorten the
+                # batch at a resolution boundary while retaining one model load.
+                batch_size = image_sizes[start]
+                while batch_end > start + 1 and any(
+                    size != batch_size for size in image_sizes[start:batch_end]
+                ):
+                    batch_end -= 1
+                height, width = batch_size
+            else:
+                height = args.height or model.image_resolution
+                width = args.width or model.image_resolution
+            batch_prompts = prompts[start:batch_end]
+            batch_indices = range(start, start + len(batch_prompts))
+            if args.skip_existing and all(output_exists(index) for index in batch_indices):
+                # Preserve the seeded latent stream so a partially resumed run
+                # produces the same later samples as an uninterrupted run.
+                if latent_generator is not None:
+                    skipped = torch.randn(
+                        (len(batch_prompts), model.in_channels, height // 8, width // 8),
+                        generator=latent_generator,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
+                    del skipped
+                print(f"Skipping existing sample indices [{start}, {start + len(batch_prompts)}).")
+                start = batch_end
+                continue
+            native_text_num_tokens = getattr(model, "checkpoint_text_num_tokens", model.text_num_tokens)
+            batch_text_num_tokens = select_text_context_length(
+                tokenizer,
+                batch_prompts,
+                model,
+                args.dynamic_text_context,
+            )
+            if batch_text_num_tokens not in reported_text_lengths:
+                print(
+                    f"Using text context length {batch_text_num_tokens} for this checkpoint "
+                    f"(native={native_text_num_tokens}, maximum={model.text_num_tokens})."
+                )
+                reported_text_lengths.add(batch_text_num_tokens)
+            text, mask = encode_prompt(
+                tokenizer,
+                text_encoder,
+                batch_prompts,
+                device,
+                batch_text_num_tokens,
+                args.caption_overflow,
+            )
+            latents = denoise_latents(
+                model,
+                text,
+                mask,
+                args,
+                device,
+                latent_generator,
+                height=height,
+                width=width,
+            )
             images = decode_vae(vae, latents, args.vae_batch_size)
             
             for offset, image in enumerate(images):
                 curr_image_index = start + offset
-                if args.prompt_set is not None and (("geneval" in args.prompt_set) or ("dpg" in args.prompt_set)):
-                    curr_prompt_index = curr_image_index // 4
-                    idx_for_same_prompt = curr_image_index % 4
-                    save_folder_same_prompt = os.path.join(args.outdir, f"{curr_prompt_index:0>5}", "samples")
-                    os.makedirs(save_folder_same_prompt, exist_ok=True)
-                    Image.fromarray(image).save(os.path.join(save_folder_same_prompt, f"{idx_for_same_prompt:05}.png"))
-                elif args.prompt_set is not None and (("prism" in args.prompt_set) or ("CVTG-2K" in args.prompt_set)):
-                    Image.fromarray(image).save(os.path.join(args.outdir, f"{curr_image_index:05d}.png"))
-                elif args.prompt_set is not None and "longtext" in args.prompt_set:
-                    curr_prompt_index = curr_image_index // 4
-                    idx_for_same_prompt = curr_image_index % 4
-                    Image.fromarray(image).save(os.path.join(args.outdir, f"{curr_prompt_index:0>4}_{idx_for_same_prompt}.png"))
-                else:
-                    Image.fromarray(image).save(os.path.join(args.outdir, f"{curr_image_index:06d}.png"))
+                save_path = output_path(curr_image_index)
+                if args.skip_existing and output_exists(curr_image_index):
+                    continue
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                Image.fromarray(image).save(save_path)
             del text, mask, latents, images
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            start = batch_end

@@ -130,6 +130,45 @@ class GeometryTests(unittest.TestCase):
             result = infer(x.repeat(2, 1, 1, 1), torch.ones(2), cfg_text, cfg_mask)
         self.assertEqual(result.shape, (2, 32, 8, 12))
 
+    def test_dynamic_inference_context_preserves_native_output(self):
+        config = dataclasses.asdict(tiny_config())
+        source = inference.i1DiT(**config).eval()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "checkpoint.pt")
+            torch.save({"config": config, "model": source.state_dict()}, path)
+            native = inference.build_model(torch.device("cpu"), path, dtype=torch.float32)
+            extended = inference.build_model(
+                torch.device("cpu"), path, dtype=torch.float32, text_num_tokens=16
+            )
+
+        tokenizer = FakeTokenizer()
+        self.assertEqual(
+            inference.select_text_context_length(tokenizer, ["short"], extended, True), 8
+        )
+        self.assertEqual(
+            inference.select_text_context_length(tokenizer, ["long enough"], extended, True), 16
+        )
+        self.assertEqual(
+            inference.select_text_context_length(tokenizer, ["short"], extended, False), 16
+        )
+
+        x = torch.randn(2, 32, 8, 8)
+        t = torch.ones(2)
+        caption = torch.randn(1, 8, 24)
+        mask = torch.tensor([[True] * 6 + [False] * 2])
+        native_cfg = inference.prepare_cfg_conditioning(native, caption, mask)
+        extended_cfg = inference.prepare_cfg_conditioning(extended, caption, mask)
+        with torch.no_grad():
+            native_output = native(x, t, *native_cfg)
+            extended_output = extended(x, t, *extended_cfg)
+        torch.testing.assert_close(native_output, extended_output, rtol=0, atol=0)
+
+        long_caption = torch.randn(1, 16, 24)
+        long_mask = torch.ones(1, 16, dtype=torch.bool)
+        long_cfg = inference.prepare_cfg_conditioning(extended, long_caption, long_mask)
+        with torch.no_grad():
+            self.assertEqual(extended(x, t, *long_cfg).shape, x.shape)
+
     def test_compiled_blocks_with_activation_checkpointing(self):
         model = i1DiT(tiny_config(use_grad_ckpt=True))
         for block in [*model.in_blocks, model.mid_block, *model.out_blocks]:

@@ -88,6 +88,30 @@ Use `PREPARE_ONLY=1` to inspect the selected prompts without starting GPU work,
 or override `PROMPT_COUNT` to run a smaller subset. With the default count of
 107, `SELECTION` has no effect because every qualifying prompt is included.
 
+### Generate the five checkpoint/context settings
+
+`run_five_settings.sh` generates the complete benchmark under these settings:
+
+1. Starting checkpoint truncated at 256 tokens.
+2. Starting checkpoint extended to retain every token.
+3. Full-data SFT step 6262 truncated at 1,024 tokens.
+4. DenseText-captioned SFT step 6245 truncated at 1,024 tokens.
+5. DenseText-captioned SFT step 6245 extended to retain every token.
+
+The script measures the longest prompt with the same T5Gemma tokenizer used by
+inference, uses `caption-overflow=error` for both all-token arms, and is
+resumable through `--skip-existing`. It runs the two DenseText-captioned step
+6245 settings first, followed by the starting-checkpoint settings and the
+full-data SFT checkpoint.
+
+```bash
+GPU_IDS=0,1,2,3,4,5,6,7 ./run_five_settings.sh
+```
+
+Use `PREPARE_ONLY=1` to prepare the inputs and inspect the measured token range
+without loading a checkpoint. `LIMIT`, `NUM_STEPS`, `OUTPUT_ROOT`, and the other
+generation overrides accepted by `run_generation.sh` are also available.
+
 ## 3. Install the official evaluator
 
 The judge calls Gemini and therefore requires network/API access:

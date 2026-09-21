@@ -82,6 +82,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Use only the first N rows; 0 (the default) uses the full benchmark.",
     )
+    parser.add_argument(
+        "--tokenizer",
+        help=(
+            "Optionally measure every prompt with this Hugging Face tokenizer and "
+            "write token_lengths.tsv plus max_text_tokens.txt."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -116,6 +123,23 @@ def main() -> None:
     if len(set(names)) != len(names):
         raise ValueError("BizGenEval output filenames are not unique")
 
+    token_lengths: list[int] | None = None
+    if args.tokenizer:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        token_lengths = [
+            len(token_ids)
+            for token_ids in tokenizer(
+                [item["prompt"] for item in prepared],
+                truncation=False,
+                padding=False,
+                add_special_tokens=True,
+            )["input_ids"]
+        ]
+        for item, token_length in zip(prepared, token_lengths):
+            item["_i1_text_tokens"] = token_length
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = args.output_dir / "bizgeneval_i1.jsonl"
     names_path = args.output_dir / "output_names.txt"
@@ -123,6 +147,16 @@ def main() -> None:
         for item in prepared:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     names_path.write_text("\n".join(names) + "\n", encoding="utf-8")
+    if token_lengths is not None:
+        lengths_path = args.output_dir / "token_lengths.tsv"
+        maximum_path = args.output_dir / "max_text_tokens.txt"
+        with lengths_path.open("w", encoding="utf-8") as handle:
+            handle.write("index\tid\toutput_name\ttokens\n")
+            for index, (item, name, token_length) in enumerate(
+                zip(prepared, names, token_lengths)
+            ):
+                handle.write(f"{index}\t{item.get('id', '')}\t{name}\t{token_length}\n")
+        maximum_path.write_text(f"{max(token_lengths)}\n", encoding="utf-8")
 
     shape_counts: dict[tuple[int, int], int] = {}
     for item in prepared:
@@ -130,6 +164,11 @@ def main() -> None:
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
     print(f"Prepared {len(prepared)} prompts in {dataset_path}")
     print(f"Output names: {names_path}")
+    if token_lengths is not None:
+        print(
+            f"Text tokens ({args.tokenizer}): "
+            f"{min(token_lengths)}..{max(token_lengths)}"
+        )
     print("Shapes: " + ", ".join(f"{h}x{w}={count}" for (h, w), count in sorted(shape_counts.items())))
 
 

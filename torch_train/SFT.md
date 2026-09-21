@@ -4,9 +4,10 @@ The SFT configs initialize from an existing i1 checkpoint, train on original
 images grouped into rectangular buckets, and accept captions up to 1,024 tokens.
 The VAE and T5Gemma encoder remain frozen; the DiT and its text adapter are trained.
 The JSONL SFT path does not require TensorFlow; the existing TFRecord training path
-is unchanged. After environment setup, follow the consolidated
-[CPU/GPU preflight workflow](#preflight-cpu-preparation-gpu-checks-and-training-smoke-test)
-before production training.
+is unchanged. For the current unified v4 dataset, follow the
+[end-to-end production pipeline](#end-to-end-production-pipeline-gpu-captioning-to-sft).
+The later [CPU/GPU preflight workflow](#preflight-cpu-preparation-gpu-checks-and-training-smoke-test)
+provides reusable diagnostics and smoke tests.
 
 ## Prepare the training environment
 
@@ -157,6 +158,367 @@ short-side filters run before assignment; upscaling is disabled by default. Pixe
 area alone does not establish text readability. Square TFRecords cannot restore
 text removed by an earlier crop. See the resolution/batching reference below for
 bucket geometry and sampling details.
+
+## End-to-end production pipeline: GPU captioning to SFT
+
+This section is the production runbook for the unified dense-text v4 dataset. It
+covers the complete handoff between three machines/stages:
+
+1. an eight-GPU machine selects and captions unified Parquet rows;
+2. a CPU machine exports captioned Parquet, audits every caption and image, and
+   builds an accepted-only pixel cache;
+3. an eight-A800 80 GB machine fine-tunes i1 at 1024 resolution and reports to
+   Weights & Biases online.
+
+The stages communicate through NFS and Ceph. Do not copy partial JSONL files
+between machines, and do not start a downstream stage before its upstream
+completion artifact exists.
+
+### Fixed production paths and expected result
+
+```bash
+export DENSE_PROJECT=/cephfs/liuxinyu/DenseText-Project
+export UNIFIED_SOURCE=/nfs_yaoyuan/liuxinyu/textdense_primary_english_unified_v2
+export CAPTION_OUTPUT=/nfs_yaoyuan/liuxinyu/textdense_primary_english_captioned_v4
+export CAPTION_CACHE="$DENSE_PROJECT/artifacts/textdense_primary_english_captioned_v4_precompute/cache_1024"
+export SFT_MANIFEST="$CAPTION_CACHE/cache.jsonl"
+export SFT_CONFIG="$DENSE_PROJECT/i1/torch_train/configs/sft_1024_captioned.py"
+export SFT_INIT=/cephfs/liuxinyu/.cache/data_juicer/models/i1-3B/1024_resolution_checkpoint_torch.pt
+export SFT_WORKDIR="$DENSE_PROJECT/artifacts/sft_densetext_captioned_v4_1024"
+# Private task-manager credentials used to release the GPU VM after completion.
+export GPU_COMPLETION_CONFIG="$DENSE_PROJECT/local_captioning/completion_config.json"
+```
+
+The completed v4 preparation selected 202,812 rows from four sources. The CPU
+audit accepted 199,095 rows and rejected 3,717: 1,325 captions over the 1,024-token
+T5Gemma limit, 1,314 images with a side over 4,096 pixels, and 1,078 images over
+4,096 squared pixels. The accepted cache has 45 populated buckets and resolves to
+6,245 optimizer steps for one epoch at global batch 32.
+
+If the source selection, caption model/prompt, token limit, image limits, bucket
+frontier, or transform policy changes, use new caption/cache/work directories.
+The manifest and transform fingerprints intentionally reject incompatible reuse.
+
+### Stage 1: prepare and caption on the GPU machine
+
+Use the existing `qwen` environment. The caption launcher starts one independent
+Gemma replica per visible GPU (`TP_SIZE=1`) and writes one resumable part file per
+worker. Keep the same GPU count and GPU ordering when resuming because part
+ownership depends on the worker count.
+
+First create or validate the deterministic input selection. This is a metadata
+and UID scan and does not consume GPU inference:
+
+```bash
+cd "$DENSE_PROJECT/local_captioning"
+
+/root/miniconda3/envs/qwen/bin/python run_unified_production.py \
+  --stage prepare \
+  --dataset "$UNIFIED_SOURCE" \
+  --output-dir "$CAPTION_OUTPUT" \
+  --sources danqing monet paper2fig100k chartgalaxy_real
+```
+
+Then launch captioning on eight GPUs:
+
+```bash
+cd "$DENSE_PROJECT/local_captioning"
+
+export HF_HUB_CACHE=/cephfs/liuxinyu/.cache/data_juicer/models
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+GPUS=0,1,2,3,4,5,6,7 \
+/root/miniconda3/envs/qwen/bin/python run_unified_production.py \
+  --stage caption \
+  --dataset "$UNIFIED_SOURCE" \
+  --output-dir "$CAPTION_OUTPUT" \
+  --sources danqing monet paper2fig100k chartgalaxy_real \
+  --completion-config "$GPU_COMPLETION_CONFIG"
+```
+
+The optional completion configuration contains GPU-task-manager credentials. Keep
+it outside the repository with mode 0600, and omit `--completion-config` when
+automatic VM release is not wanted. A successful notified run releases the
+configured GPU VMs only after all workers finish and `captions.jsonl` has been
+atomically merged.
+
+The command is resumable. Relaunch the same command after interruption; completed
+IDs in the eight `captions.part-*-of-00008.jsonl` files are skipped. Do not alter
+the prompt, OCR injection, model settings, or worker count inside one output
+directory.
+
+Completion evidence:
+
+```bash
+test -f "$CAPTION_OUTPUT/captions.jsonl"
+wc -l "$CAPTION_OUTPUT/caption_input.jsonl" "$CAPTION_OUTPUT/captions.jsonl"
+
+/root/miniconda3/envs/qwen/bin/python - <<'PY'
+import collections
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["CAPTION_OUTPUT"]) / "captions.jsonl"
+statuses = collections.Counter()
+with path.open(encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            statuses[json.loads(line).get("caption_status")] += 1
+print(dict(statuses))
+PY
+```
+
+For the frozen v4 run, both files contain 202,812 rows and the status count is
+`{"ok": 202812}`. `ok` means that generation returned a nonempty caption; the CPU
+stage applies the authoritative training-token and image checks.
+
+### Stage 2: export, audit, and build the cache on the CPU machine
+
+Run the fused CPU stage only after `captions.jsonl` exists. It first exports
+captioned Parquet with original compressed image bytes to NFS, then invokes the
+accepted-only cache builder with the T5Gemma tokenizer. Both phases are resumable.
+
+```bash
+cd "$DENSE_PROJECT/local_captioning"
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+HF_HUB_CACHE=/cephfs/liuxinyu/.cache/data_juicer/models \
+OMP_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+/root/miniconda3/envs/i1_sft/bin/python run_unified_cpu.py \
+  --dataset "$UNIFIED_SOURCE" \
+  --output-dir "$CAPTION_OUTPUT" \
+  --cache-output-dir "$CAPTION_CACHE" \
+  --resolution 1024 \
+  --cache-workers 8 \
+  --token-limit 1024
+```
+
+The NFS export retains every captioned row. The Ceph training cache contains only
+accepted rows. Captions over 1,024 T5Gemma tokens are not truncated: they are
+written to `rejected.jsonl` with reason `caption_too_long` and omitted from
+`cache.jsonl`. Broken images, inconsistent dimensions, oversized sources, and
+ineligible bucket geometry are handled the same way with explicit reason codes.
+
+Verify the completed summaries and manifest counts:
+
+```bash
+/root/miniconda3/envs/i1_sft/bin/python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+caption_output = Path(os.environ["CAPTION_OUTPUT"])
+cache = Path(os.environ["CAPTION_CACHE"])
+export = json.loads((caption_output / "export_summary.json").read_text())
+summary = json.loads((cache / "summary.json").read_text())
+assert export["count"] == 202812
+assert summary["status"] == "complete"
+assert summary["inspected"] == 202812
+assert summary["count"] == 199095
+assert summary["rejected"] == 3717
+assert summary["verified_all_written_bytes"] is True
+print("export", export["count"], export["caption_status_counts"])
+print("cache", summary["count"], "accepted;", summary["rejected"], "rejected")
+print("reasons", summary["rejected_counts"])
+print("tokens", summary["caption_tokens"])
+PY
+
+wc -l "$CAPTION_CACHE/cache.jsonl" "$CAPTION_CACHE/rejected.jsonl"
+```
+
+Do not train from `captions.jsonl`, the NFS Parquet directory, or
+`rejected.jsonl`. The production training input is exactly
+`$CAPTION_CACHE/cache.jsonl`; its records point into verified binary RGB cache
+shards under `$CAPTION_CACHE/parts`.
+
+### Stage 3: preflight the eight-A800 training machine
+
+Activate `i1_sft`, restore the path variables from the first subsection, and
+verify the checkpoint, cache, CUDA visibility, BF16 support, shared memory, and
+free checkpoint space. The default eight-rank DataLoader can queue roughly 3 GiB
+of float32 images; allocate about 16 GiB of `/dev/shm` rather than the common 64
+MiB container default.
+
+```bash
+conda activate i1_sft
+cd "$DENSE_PROJECT/i1/torch_train"
+
+test -f "$SFT_MANIFEST"
+test -f "$SFT_INIT"
+test -f "$CAPTION_CACHE/summary.json"
+test -f "$GPU_COMPLETION_CONFIG"
+test "$(stat -c '%a' "$GPU_COMPLETION_CONFIG")" = 600
+mkdir -p "$SFT_WORKDIR"
+df -h "$SFT_WORKDIR" /dev/shm
+
+python - <<'PY'
+import torch
+
+assert torch.cuda.device_count() == 8, torch.cuda.device_count()
+for index in range(8):
+    props = torch.cuda.get_device_properties(index)
+    with torch.cuda.device(index):
+        assert torch.cuda.is_bf16_supported(), index
+    print(index, props.name, f"{props.total_memory / 2**30:.1f} GiB")
+PY
+```
+
+Run the NCCL check and all-bucket compiled smoke test in the GPU preflight below
+before a new production run. The conservative validated starting topology is
+FSDP-8, tensor parallelism 1, global batch 32, and four accumulation passes, which
+gives one image per GPU per microbatch. `grad_accum=2` or `1` retains global batch
+32 but increases the microbatch to two or four images per GPU; use it only after
+an all-bucket memory/throughput smoke test in a separate workdir.
+
+### Stage 4: start training with online Weights & Biases
+
+Use a new workdir. An existing `checkpoint.pt` takes precedence and causes a
+resume, so explicitly stop if the intended fresh directory already contains one.
+Run inside a durable scheduler allocation or `tmux` session.
+
+The config enables W&B project `DenseText-SFT` with run name
+`i1-1024-captioned-v4`. Once per machine, install and authenticate it with
+`python -m pip install wandb` and `wandb login`. For unattended jobs, provide
+`WANDB_API_KEY` through the cluster secret manager, never through repository
+files or logs.
+
+```bash
+conda activate i1_sft
+cd "$DENSE_PROJECT/i1/torch_train"
+
+if test -e "$SFT_WORKDIR/checkpoint.pt"; then
+  echo "Refusing a fresh launch: $SFT_WORKDIR/checkpoint.pt already exists" >&2
+  exit 1
+fi
+
+mkdir -p "$SFT_WORKDIR" "$SFT_WORKDIR/wandb"
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HF_HUB_CACHE=/cephfs/liuxinyu/.cache/data_juicer/models
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export OMP_NUM_THREADS=1
+export WANDB_MODE=online
+export WANDB_PROJECT=DenseText-SFT
+export WANDB_DIR="$SFT_WORKDIR/wandb"
+
+set -o pipefail
+/root/miniconda3/envs/i1_sft/bin/torchrun \
+  --standalone \
+  --nproc_per_node=8 \
+  -m training.main \
+  --config "$SFT_CONFIG" \
+  --manifest "$SFT_MANIFEST" \
+  --init_from "$SFT_INIT" \
+  --workdir "$SFT_WORKDIR" \
+  --fsdp 8 \
+  --batch_size 32 \
+  --grad_accum 4 \
+  --no_compile \
+  --completion-config "$GPU_COMPLETION_CONFIG" \
+  2>&1 | tee "$SFT_WORKDIR/train.log"
+```
+
+Rank zero prints the online W&B URL; the other ranks do not create duplicate
+runs. Expected startup values are 199,095 images, 45 buckets, global batch 32,
+microbatch 1 per rank, four accumulation passes, and 6,245 optimizer steps.
+`--no_compile` avoids a PyTorch 2.9.1 TorchInductor stride assertion when compiled
+backward graphs move between rectangular buckets. It retains eager-mode training
+semantics at lower throughput; remove it only after the all-bucket compiled smoke
+test passes with the installed PyTorch build. After the final optimizer step and
+checkpoint finish on every rank, rank zero flushes pending W&B logs and posts the
+task-finished notification using
+`/cephfs/liuxinyu/DenseText-Project/local_captioning/completion_config.json`.
+An exception, signal, failed rank, or incomplete checkpoint never reaches this
+notification path. A notification failure is retried three times and then makes
+the otherwise completed command exit nonzero instead of silently leaving the VM
+running.
+
+Monitor both the durable log and W&B:
+
+```bash
+tail -f "$SFT_WORKDIR/train.log"
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+  --format=csv -l 5
+```
+
+Evaluate held-out rendering prompts at retained checkpoints; healthy loss and
+gradient metrics alone do not establish generation quality.
+
+### Stage 5: resume an interrupted training run
+
+Restore the fixed path variables and Stage 4 environment exports, keeping the
+same config, manifest, topology, batch settings, seed, and workdir. Then replace
+`--init_from` with `--resume`:
+
+```bash
+cd "$DENSE_PROJECT/i1/torch_train"
+
+test -f "$SFT_WORKDIR/checkpoint.pt"
+set -o pipefail
+/root/miniconda3/envs/i1_sft/bin/torchrun \
+  --standalone \
+  --nproc_per_node=8 \
+  -m training.main \
+  --config "$SFT_CONFIG" \
+  --manifest "$SFT_MANIFEST" \
+  --resume "$SFT_WORKDIR/checkpoint.pt" \
+  --workdir "$SFT_WORKDIR" \
+  --fsdp 8 \
+  --batch_size 32 \
+  --grad_accum 4 \
+  --no_compile \
+  --completion-config "$GPU_COMPLETION_CONFIG" \
+  2>&1 | tee -a "$SFT_WORKDIR/train.log"
+```
+
+This restores model, optimizer, EMA, step, and sampler position. The completion
+notification is sent only when the resumed run reaches its configured final step.
+Noise and dropout RNG are not restored bit-for-bit. The current trainer starts a
+new W&B run after process restart because it does not persist the W&B run ID;
+checkpoint resumption is unaffected.
+
+### Destructive smoke test for automatic VM shutdown
+
+`smoke_test_completion_shutdown.sh` runs three eager-mode steps with the real
+production model, manifest, eight-rank FSDP topology, and completion credentials.
+It writes to a separate timestamped workdir, saves a final checkpoint, and then
+calls the real task-finished endpoint. The configured VM is expected to power off.
+The script refuses to start when a GPU compute process is present and requires an
+explicit destructive-operation acknowledgement:
+
+```bash
+cd "$DENSE_PROJECT/i1/torch_train"
+CONFIRM_GPU_SHUTDOWN=YES ./smoke_test_completion_shutdown.sh
+```
+
+Do not run this alongside production training. After the VM is started again,
+inspect the durable Ceph artifacts from the most recent test:
+
+```bash
+SFT_SMOKE_WORKDIR=$(cat \
+  "$DENSE_PROJECT/artifacts/sft_completion_shutdown_smoke/latest_run.txt")
+test -f "$SFT_SMOKE_WORKDIR/checkpoint.pt"
+grep -E 'saved checkpoint|task-finished notification acknowledged' \
+  "$SFT_SMOKE_WORKDIR/train.log"
+```
+
+Success requires a final-step checkpoint, an HTTP acknowledgement in the log,
+and the VM becoming unavailable. The script does not reuse or modify the
+production checkpoint. Override `SFT_SMOKE_STEPS` only when more than three steps
+are needed.
+
+An already-running trainer has imported its code and cannot acquire this update
+in place. To switch it over, wait for a `saved checkpoint` line in `train.log`,
+send one `Ctrl-C` to the foreground `torchrun` process (or `kill -INT` to its
+launcher PID), and wait until all `training.main` workers exit. Then use the
+Stage 5 resume command above, including
+`--completion-config "$GPU_COMPLETION_CONFIG"`. Interrupting between checkpoints
+discards the steps since the most recent saved checkpoint but does not corrupt
+that atomic checkpoint.
 
 ## Preflight: CPU preparation, GPU checks, and training smoke test
 

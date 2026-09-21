@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+from pathlib import Path
 import re
 import time
 
@@ -15,6 +16,11 @@ from diffusion import rectified_flow
 from models.dit import build_dit_model
 from training import checkpoint as ckpt_lib
 from training import optim as optim_lib
+from training.completion import (
+    DEFAULT_COMPLETION_URL,
+    load_completion_config,
+    notify_task_completion_with_retries,
+)
 from training.parallel import init_distributed, parallelize, load_tp_batch, compile_blocks
 from utils.common import itstime, log
 from vae.vae import VAE_CONFIGS, encode_images_to_latents, load_vae, scale_latents
@@ -64,6 +70,16 @@ def main():
     parser.add_argument("--keep_ckpt_steps", type=int, default=None, help="Override config.keep_ckpt_steps.")
     parser.add_argument("--data_dir", default=None, help="Override the dataset dir (single source, weight 1.0).")
     parser.add_argument("--no_amp", action="store_true", help="Disable bf16 mixed precision (train in fp32).")
+    parser.add_argument("--no_compile", action="store_true",
+                        help="Disable torch.compile and run model blocks eagerly.")
+    parser.add_argument(
+        "--completion-config", default=os.environ.get("GPU_TASK_COMPLETION_CONFIG"),
+        help="Mode-0600 JSON task-manager credentials; notify only after successful training.")
+    parser.add_argument(
+        "--completion-url", default=os.environ.get(
+            "GPU_TASK_COMPLETION_URL", DEFAULT_COMPLETION_URL))
+    parser.add_argument("--completion-timeout", type=float, default=15)
+    parser.add_argument("--completion-attempts", type=int, default=3)
     checkpoints = parser.add_mutually_exclusive_group()
     checkpoints.add_argument("--resume", default=None, help="Resume a training checkpoint, including optimizer and step.")
     checkpoints.add_argument("--init_from", default=None, help="Initialize fresh SFT from model/EMA weights only.")
@@ -71,6 +87,9 @@ def main():
                         help="JSONL manifest, Parquet shard, or GPT-Image output directory for bucketed SFT.")
     parser.add_argument("--token_len", type=int, default=None, help="Maximum caption tokens for a new training run.")
     args = parser.parse_args()
+
+    if args.completion_timeout <= 0 or args.completion_attempts <= 0:
+        parser.error("--completion-timeout and --completion-attempts must be positive")
 
     config = load_config(args.config)
     if args.total_steps is not None:
@@ -110,12 +129,19 @@ def main():
         config.token_len = args.token_len
     if args.no_amp:
         config.amp = False
+    if args.no_compile:
+        config.compile = False
     amp = config.get("amp", True)
 
     torch.set_float32_matmul_precision("high")
 
     dist_info = init_distributed(config)
     device = dist_info.device
+    completion_config = None
+    if args.completion_config and dist_info.is_main:
+        completion_config = load_completion_config(args.completion_config)
+        log(f"will notify the GPU task manager after successful training using "
+            f"{Path(args.completion_config).expanduser().resolve()}")
     if dist_info.is_main:
         log(f"world_size={dist_info.world_size} data={dist_info.data_size} "
             f"fsdp={dist_info.fsdp_size} model={dist_info.model_size}")
@@ -342,7 +368,23 @@ def main():
                                          step_copy=copy_step)
 
     if dist_info.is_distributed:
+        # Do not release the VM until every rank has completed the final step and
+        # any final distributed checkpoint collectives.
+        torch.distributed.barrier()
         torch.distributed.destroy_process_group()
+
+    if completion_config is not None:
+        if use_wandb:
+            # Upload pending metrics before the task manager can power off the VM.
+            wandb.finish()
+        status = notify_task_completion_with_retries(
+            completion_config,
+            url=args.completion_url,
+            timeout=args.completion_timeout,
+            attempts=args.completion_attempts,
+            log_fn=log,
+        )
+        log(f"training complete; task-finished notification acknowledged: HTTP {status}")
 
 
 if __name__ == "__main__":

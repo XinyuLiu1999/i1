@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 I1_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PROJECT_ROOT="$(cd -- "$I1_ROOT/.." && pwd)"
 
-BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-/cephfs/liuxinyu/BizGenEval}"
+BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-$PROJECT_ROOT/../T2IBenchs/BizGenEval}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_start_vs_sft6262}"
 EVALUATION_PYTHON="${EVALUATION_PYTHON:-python}"
 EVALUATION_CONFIG="${EVALUATION_CONFIG:-$BIZGENEVAL_ROOT/config/evaluation_config.yaml}"

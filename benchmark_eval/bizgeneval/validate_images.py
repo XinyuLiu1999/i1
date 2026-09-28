@@ -14,21 +14,29 @@ def main() -> None:
     parser.add_argument("--names", type=Path, required=True)
     parser.add_argument("--image-dir", type=Path, required=True)
     parser.add_argument("--data", type=Path)
-    parser.add_argument("--geometry", choices=("existence", "square", "native_buckets"), default="existence")
+    parser.add_argument(
+        "--geometry",
+        choices=("existence", "square", "native_buckets", "native_buckets_2048"),
+        default="existence",
+    )
     args = parser.parse_args()
 
     names = [line.strip() for line in args.names.read_text(encoding="utf-8").splitlines() if line.strip()]
     expected_sizes: list[tuple[int, int] | None] = [None] * len(names)
     if args.geometry == "square":
         expected_sizes = [(1024, 1024)] * len(names)
-    elif args.geometry == "native_buckets":
+    elif args.geometry in {"native_buckets", "native_buckets_2048"}:
         if args.data is None:
-            raise SystemExit("--data is required with --geometry native_buckets")
+            raise SystemExit(f"--data is required with --geometry {args.geometry}")
         with args.data.open("r", encoding="utf-8") as handle:
             rows = [json.loads(line) for line in handle if line.strip()]
         if len(rows) != len(names):
             raise SystemExit(f"Dataset has {len(rows)} rows but names file has {len(names)} entries")
-        expected_sizes = [(int(row["_i1_width"]), int(row["_i1_height"])) for row in rows]
+        suffix = "_2048" if args.geometry == "native_buckets_2048" else ""
+        expected_sizes = [
+            (int(row[f"_i1_width{suffix}"]), int(row[f"_i1_height{suffix}"]))
+            for row in rows
+        ]
 
     invalid: list[str] = []
     for name, expected_size in zip(names, expected_sizes):

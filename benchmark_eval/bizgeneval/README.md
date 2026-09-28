@@ -2,7 +2,7 @@
 
 This pipeline generates all 400 [BizGenEval](https://github.com/microsoft/BizGenEval)
 images with both i1 checkpoints, evaluates them with the official Gemini-based
-judge in `/cephfs/liuxinyu/BizGenEval`, summarizes each run, and writes direct
+judge in `/cephfs/liuxinyu/T2IBenchs/BizGenEval`, summarizes each run, and writes direct
 SFT-minus-starting-checkpoint comparisons.
 
 The configured checkpoints are:
@@ -88,36 +88,50 @@ Use `PREPARE_ONLY=1` to inspect the selected prompts without starting GPU work,
 or override `PROMPT_COUNT` to run a smaller subset. With the default count of
 107, `SELECTION` has no effect because every qualifying prompt is included.
 
-### Generate the five checkpoint/context settings
+### Generate registered checkpoint/context settings
 
-`run_five_settings.sh` generates the complete benchmark under these settings:
+`run_settings.sh` generates the complete benchmark under these settings:
 
 1. Starting checkpoint truncated at 256 tokens.
 2. Starting checkpoint extended to retain every token.
 3. Full-data SFT step 6262 truncated at 1,024 tokens.
 4. DenseText-captioned SFT step 6245 truncated at 1,024 tokens.
 5. DenseText-captioned SFT step 6245 extended to retain every token.
+6. Base-initialized, region-calibrated flow SFT step 6245 truncated at 1,024 tokens.
+7. Multiresolution-2048 SFT step 6327 evaluated with the matched 1,024-resolution
+   native buckets and 1,024-token truncation.
+8. The same multiresolution-2048 checkpoint evaluated with exactly doubled
+   native bucket dimensions (four times the pixels) and 1,024-token truncation.
 
 The script measures the longest prompt with the same T5Gemma tokenizer used by
 inference, uses `caption-overflow=error` for both all-token arms, and is
-resumable through `--skip-existing`. It runs the two DenseText-captioned step
-6245 settings first, followed by the starting-checkpoint settings and the
-full-data SFT checkpoint.
+resumable through `--skip-existing`. If the sibling BizGenEval checkout is not
+available, it reuses the canonical 400-prompt copy already saved in
+`artifacts/bizgeneval_evaluation/inputs`.
 
 ```bash
-GPU_IDS=0,1,2,3,4,5,6,7 ./run_five_settings.sh
+GPU_IDS=0,1,2,3,4,5,6,7 ./run_settings.sh
+```
+
+Pass setting names to generate only a subset. For example, to add the
+region-calibrated checkpoint to an existing evaluation artifact:
+
+```bash
+GPU_IDS=0,1,2,3,4,5,6,7 ./run_settings.sh \
+  06_base_region_calibrated_p0_6245_truncate_1024
 ```
 
 Use `PREPARE_ONLY=1` to prepare the inputs and inspect the measured token range
 without loading a checkpoint. `LIMIT`, `NUM_STEPS`, `OUTPUT_ROOT`, and the other
-generation overrides accepted by `run_generation.sh` are also available.
+generation overrides accepted by `run_generation.sh` are also available. The
+default is 50 denoising steps, matching the saved evaluation artifact.
 
 ## 3. Install the official evaluator
 
 The judge calls Gemini and therefore requires network/API access:
 
 ```bash
-cd /cephfs/liuxinyu/BizGenEval
+cd /cephfs/liuxinyu/T2IBenchs/BizGenEval
 conda create -n bizgeneval python=3.12 -y
 conda activate bizgeneval
 pip install -r requirements.txt

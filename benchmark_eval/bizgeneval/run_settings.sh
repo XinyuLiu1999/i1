@@ -1,23 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run all BizGenEval prompts under five checkpoint/context configurations:
+# Run all BizGenEval prompts under registered checkpoint/context configurations.
+# With no positional arguments every setting is generated; pass one or more
+# setting names to generate only that subset.
+#
+# The setting registry contains:
 #   1. Starting checkpoint, truncated to its native 256-token context.
 #   2. Starting checkpoint, extended to the longest prompt (no truncation).
 #   3. Full-data SFT checkpoint, truncated to its native 1024-token context.
 #   4. DenseText-captioned SFT checkpoint, truncated to 1024 tokens.
 #   5. DenseText-captioned SFT checkpoint, extended to the longest prompt.
+#   6. Region-calibrated flow checkpoint, truncated to 1024 tokens.
+#   7. Multiresolution-2048 SFT checkpoint, evaluated at matched 1024 geometry.
+#   8. Multiresolution-2048 SFT checkpoint, evaluated at doubled 2048 geometry.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 I1_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PROJECT_ROOT="$(cd -- "$I1_ROOT/.." && pwd)"
 
-BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-$PROJECT_ROOT/../BizGenEval}"
-DATA_PATH="${DATA_PATH:-$BIZGENEVAL_ROOT/assets/bizgeneval.jsonl}"
+BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-$PROJECT_ROOT/../T2IBenchs/BizGenEval}"
+DEFAULT_DATA_PATH="$BIZGENEVAL_ROOT/assets/bizgeneval.jsonl"
+SAVED_DATA_PATH="$PROJECT_ROOT/artifacts/bizgeneval_evaluation/inputs/bizgeneval_i1.jsonl"
+if [[ ! -f "$DEFAULT_DATA_PATH" && -f "$SAVED_DATA_PATH" ]]; then
+    DEFAULT_DATA_PATH="$SAVED_DATA_PATH"
+fi
+DATA_PATH="${DATA_PATH:-$DEFAULT_DATA_PATH}"
 START_CHECKPOINT="${START_CHECKPOINT:-/cephfs/liuxinyu/.cache/data_juicer/models/i1-3B/1024_resolution_checkpoint_torch.pt}"
 FULL_SFT_CHECKPOINT="${FULL_SFT_CHECKPOINT:-$PROJECT_ROOT/artifacts/sft_1024_full_20260917_094936/checkpoint.pt-000006262}"
 CAPTIONED_SFT_CHECKPOINT="${CAPTIONED_SFT_CHECKPOINT:-$PROJECT_ROOT/artifacts/sft_densetext_captioned_v4_1024/checkpoint.pt-000006245}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_five_settings}"
+REGION_CALIBRATED_CHECKPOINT="${REGION_CALIBRATED_CHECKPOINT:-$PROJECT_ROOT/artifacts/region_weighted_flow_2026-09-21/base_region_calibrated_p0/checkpoint.pt-000006245}"
+HIGH_RES_CHECKPOINT="${HIGH_RES_CHECKPOINT:-$PROJECT_ROOT/artifacts/high_resolution_2026-09-22/train_2048/checkpoint.pt-000006327}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_evaluation}"
+
+ALL_SETTINGS=(
+    "01_start_truncate_256"
+    "02_start_all_tokens"
+    "03_full_sft_6262_truncate_1024"
+    "04_captioned_sft_6245_truncate_1024"
+    "05_captioned_sft_6245_all_tokens"
+    "06_base_region_calibrated_p0_6245_truncate_1024"
+    "07_highres_2048_sft_6327_at_1024"
+    "08_highres_2048_sft_6327_at_2048"
+)
+if (( $# > 0 )); then
+    SETTINGS=("$@")
+else
+    SETTINGS=("${ALL_SETTINGS[@]}")
+fi
 
 DEFAULT_PYTHON="/root/miniconda3/envs/i1_sft/bin/python"
 if [[ ! -x "$DEFAULT_PYTHON" ]]; then
@@ -29,7 +59,7 @@ TOKENIZER="${TOKENIZER:-google/t5gemma-2b-2b-ul2-it}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 GPU_LAUNCH_DELAY="${GPU_LAUNCH_DELAY:-10}"
 LIMIT="${LIMIT:-0}"
-NUM_STEPS="${NUM_STEPS:-250}"
+NUM_STEPS="${NUM_STEPS:-50}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"
 DIFFUSION_BATCH_SIZE="${DIFFUSION_BATCH_SIZE:-1}"
@@ -38,13 +68,43 @@ CFG_SCALE="${CFG_SCALE:-12}"
 CFG_RESCALE="${CFG_RESCALE:-1.0}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 
-for required_file in \
-    "$DATA_PATH" \
-    "$START_CHECKPOINT" \
-    "$FULL_SFT_CHECKPOINT" \
-    "$CAPTIONED_SFT_CHECKPOINT"; do
-    if [[ ! -f "$required_file" ]]; then
-        echo "Missing required file: $required_file" >&2
+is_known_setting() {
+    local candidate="$1"
+    local known
+    for known in "${ALL_SETTINGS[@]}"; do
+        if [[ "$candidate" == "$known" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+checkpoint_for_setting() {
+    case "$1" in
+        01_start_truncate_256|02_start_all_tokens) echo "$START_CHECKPOINT" ;;
+        03_full_sft_6262_truncate_1024) echo "$FULL_SFT_CHECKPOINT" ;;
+        04_captioned_sft_6245_truncate_1024|05_captioned_sft_6245_all_tokens) echo "$CAPTIONED_SFT_CHECKPOINT" ;;
+        06_base_region_calibrated_p0_6245_truncate_1024) echo "$REGION_CALIBRATED_CHECKPOINT" ;;
+        07_highres_2048_sft_6327_at_1024|08_highres_2048_sft_6327_at_2048) echo "$HIGH_RES_CHECKPOINT" ;;
+    esac
+}
+
+for setting in "${SETTINGS[@]}"; do
+    if ! is_known_setting "$setting"; then
+        echo "Unknown setting: $setting" >&2
+        echo "Known settings: ${ALL_SETTINGS[*]}" >&2
+        exit 1
+    fi
+done
+
+if [[ ! -f "$DATA_PATH" ]]; then
+    echo "Missing required file: $DATA_PATH" >&2
+    exit 1
+fi
+for setting in "${SETTINGS[@]}"; do
+    required_checkpoint="$(checkpoint_for_setting "$setting")"
+    if [[ ! -f "$required_checkpoint" ]]; then
+        echo "Missing checkpoint for $setting: $required_checkpoint" >&2
         exit 1
     fi
 done
@@ -81,14 +141,22 @@ if (( ${#GPU_ARRAY[@]} == 0 )); then
 fi
 
 INPUT_DIR="$OUTPUT_ROOT/inputs"
-"$PYTHON_BIN" "$SCRIPT_DIR/prepare_inputs.py" \
-    --input "$DATA_PATH" \
-    --output-dir "$INPUT_DIR" \
-    --limit "$LIMIT" \
-    --tokenizer "$TOKENIZER"
-
 PREPARED_DATA="$INPUT_DIR/bizgeneval_i1.jsonl"
 OUTPUT_NAMES="$INPUT_DIR/output_names.txt"
+if [[ "$DATA_PATH" == "$PREPARED_DATA" ]]; then
+    if (( LIMIT != 0 )); then
+        echo "LIMIT cannot be used in-place with the saved canonical dataset; set OUTPUT_ROOT to a new directory." >&2
+        exit 1
+    fi
+    echo "Reusing saved prepared inputs: $INPUT_DIR"
+else
+    "$PYTHON_BIN" "$SCRIPT_DIR/prepare_inputs.py" \
+        --input "$DATA_PATH" \
+        --output-dir "$INPUT_DIR" \
+        --limit "$LIMIT" \
+        --tokenizer "$TOKENIZER"
+fi
+
 MAX_PROMPT_TOKENS="$(tr -d '[:space:]' < "$INPUT_DIR/max_text_tokens.txt")"
 NUM_PROMPTS="$(wc -l < "$OUTPUT_NAMES")"
 if ! [[ "$MAX_PROMPT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
@@ -107,6 +175,10 @@ mkdir -p "$OUTPUT_ROOT"
     echo "start_checkpoint=$START_CHECKPOINT"
     echo "full_sft_checkpoint=$FULL_SFT_CHECKPOINT"
     echo "captioned_sft_checkpoint=$CAPTIONED_SFT_CHECKPOINT"
+    echo "region_calibrated_checkpoint=$REGION_CALIBRATED_CHECKPOINT"
+    echo "high_res_checkpoint=$HIGH_RES_CHECKPOINT"
+    echo "registered_settings=${ALL_SETTINGS[*]}"
+    echo "selected_settings=${SETTINGS[*]}"
     echo "prompt_count=$NUM_PROMPTS"
     echo "max_prompt_tokens=$MAX_PROMPT_TOKENS"
     echo "all_tokens_context=$ALL_TOKENS_CONTEXT"
@@ -150,6 +222,9 @@ run_setting() {
             ;;
         native_buckets)
             geometry_args=(--jsonl-height-key _i1_height --jsonl-width-key _i1_width)
+            ;;
+        native_buckets_2048)
+            geometry_args=(--jsonl-height-key _i1_height_2048 --jsonl-width-key _i1_width_2048)
             ;;
         *)
             echo "Unknown geometry mode: $geometry" >&2
@@ -231,13 +306,38 @@ run_setting() {
         --geometry "$geometry"
 }
 
-# Load the newly trained DenseText-captioned checkpoint first so both of its
-# requested settings finish before inference starts on either comparison model.
-run_setting "04_captioned_sft_6245_truncate_1024" "$CAPTIONED_SFT_CHECKPOINT" 1024 "truncate" "native_buckets"
-run_setting "05_captioned_sft_6245_all_tokens" "$CAPTIONED_SFT_CHECKPOINT" "$ALL_TOKENS_CONTEXT" "error" "native_buckets"
-run_setting "01_start_truncate_256" "$START_CHECKPOINT" 256 "truncate" "square"
-run_setting "02_start_all_tokens" "$START_CHECKPOINT" "$ALL_TOKENS_CONTEXT" "error" "square"
-run_setting "03_full_sft_6262_truncate_1024" "$FULL_SFT_CHECKPOINT" 1024 "truncate" "native_buckets"
+run_requested_setting() {
+    case "$1" in
+        01_start_truncate_256)
+            run_setting "$1" "$START_CHECKPOINT" 256 "truncate" "square"
+            ;;
+        02_start_all_tokens)
+            run_setting "$1" "$START_CHECKPOINT" "$ALL_TOKENS_CONTEXT" "error" "square"
+            ;;
+        03_full_sft_6262_truncate_1024)
+            run_setting "$1" "$FULL_SFT_CHECKPOINT" 1024 "truncate" "native_buckets"
+            ;;
+        04_captioned_sft_6245_truncate_1024)
+            run_setting "$1" "$CAPTIONED_SFT_CHECKPOINT" 1024 "truncate" "native_buckets"
+            ;;
+        05_captioned_sft_6245_all_tokens)
+            run_setting "$1" "$CAPTIONED_SFT_CHECKPOINT" "$ALL_TOKENS_CONTEXT" "error" "native_buckets"
+            ;;
+        06_base_region_calibrated_p0_6245_truncate_1024)
+            run_setting "$1" "$REGION_CALIBRATED_CHECKPOINT" 1024 "truncate" "native_buckets"
+            ;;
+        07_highres_2048_sft_6327_at_1024)
+            run_setting "$1" "$HIGH_RES_CHECKPOINT" 1024 "truncate" "native_buckets"
+            ;;
+        08_highres_2048_sft_6327_at_2048)
+            run_setting "$1" "$HIGH_RES_CHECKPOINT" 1024 "truncate" "native_buckets_2048"
+            ;;
+    esac
+}
+
+for setting in "${SETTINGS[@]}"; do
+    run_requested_setting "$setting"
+done
 
 echo
 echo "Generation complete: $OUTPUT_ROOT/images"

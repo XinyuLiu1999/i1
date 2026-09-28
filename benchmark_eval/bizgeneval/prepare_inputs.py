@@ -1,7 +1,7 @@
 """Prepare BizGenEval prompts and native i1 generation sizes.
 
-The output JSONL remains a valid BizGenEval dataset. Two private fields are
-added for torch_inference/generate.py, and output_names.txt follows the exact
+The output JSONL remains a valid BizGenEval dataset. Private geometry fields are
+added for 1024- and 2048-output inference, and output_names.txt follows the exact
 filename convention used by BizGenEval's evaluator.
 """
 
@@ -16,6 +16,8 @@ from pathlib import Path
 
 HEIGHT_KEY = "_i1_height"
 WIDTH_KEY = "_i1_width"
+HEIGHT_2048_KEY = "_i1_height_2048"
+WIDTH_2048_KEY = "_i1_width_2048"
 
 
 def generate_buckets(
@@ -117,6 +119,11 @@ def main() -> None:
         output_item = dict(item)
         output_item[HEIGHT_KEY] = height
         output_item[WIDTH_KEY] = width
+        # Preserve exactly the same aspect buckets while quadrupling pixel area.
+        # These doubled shapes are members of the multiresolution checkpoint's
+        # 2048-tier training frontier.
+        output_item[HEIGHT_2048_KEY] = height * 2
+        output_item[WIDTH_2048_KEY] = width * 2
         prepared.append(output_item)
         names.append(name)
 

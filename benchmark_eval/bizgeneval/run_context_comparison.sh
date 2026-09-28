@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 I1_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PROJECT_ROOT="$(cd -- "$I1_ROOT/.." && pwd)"
 
-BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-/cephfs/liuxinyu/BizGenEval}"
+BIZGENEVAL_ROOT="${BIZGENEVAL_ROOT:-$PROJECT_ROOT/../T2IBenchs/BizGenEval}"
 DATA_PATH="${DATA_PATH:-$BIZGENEVAL_ROOT/assets/bizgeneval.jsonl}"
 SFT_CHECKPOINT="${SFT_CHECKPOINT:-$PROJECT_ROOT/artifacts/sft_1024_full_20260917_094936/checkpoint.pt-000006262}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/artifacts/bizgeneval_sft_context_comparison_107}"

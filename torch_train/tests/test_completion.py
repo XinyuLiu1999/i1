@@ -11,6 +11,7 @@ from urllib.error import URLError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from training.completion import (
+    current_vm_id,
     load_completion_config,
     notify_task_completion,
     notify_task_completion_with_retries,
@@ -38,9 +39,10 @@ class CompletionTests(unittest.TestCase):
         expected = {"name": "trainer", "password": "secret", "vmids": ["gpu-0"]}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "completion.json"
-            path.write_text(json.dumps(expected), encoding="utf-8")
+            path.write_text(json.dumps(dict(expected, vmids=["other-vm", "stale-vm"])), encoding="utf-8")
             path.chmod(0o600)
-            config = load_completion_config(path)
+            with patch("training.completion.socket.gethostname", return_value="gpu-0.cluster.local"):
+                config = load_completion_config(path)
 
             received = {}
 
@@ -69,6 +71,23 @@ class CompletionTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(received, {"path": "/api/task_finished", "payload": expected})
+
+    def test_credentials_only_json_and_ignored_hostname_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "completion.json"
+            path.write_text(json.dumps(dict(name="trainer", password="secret")))
+            path.chmod(0o600)
+            with patch("training.completion.socket.gethostname", return_value="own-vm-0"), \
+                    patch.dict("os.environ", {"HOSTNAME": "other-vm-0"}):
+                self.assertEqual(load_completion_config(path),
+                                 dict(name="trainer", password="secret", vmids=["own-vm-0"]))
+
+    def test_invalid_hostname_fails(self):
+        for hostname in ["", "localhost", "localhost.localdomain", "bad host", "-bad"]:
+            with self.subTest(hostname=hostname), \
+                    patch("training.completion.socket.gethostname", return_value=hostname):
+                with self.assertRaisesRegex(ValueError, "current VM ID"):
+                    current_vm_id()
 
     def test_completion_config_rejects_broad_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -237,10 +237,12 @@ GPUS=0,1,2,3,4,5,6,7 \
   --completion-config "$GPU_COMPLETION_CONFIG"
 ```
 
-The optional completion configuration contains GPU-task-manager credentials. Keep
+The optional completion configuration supplies GPU-task-manager `name` and `password`.
+Captioning and training derive `vmids` from the current machine's short hostname
+(this platform's VM ID); any stored JSON `vmids` are ignored. Keep
 it outside the repository with mode 0600, and omit `--completion-config` when
 automatic VM release is not wanted. A successful notified run releases the
-configured GPU VMs only after all workers finish and `captions.jsonl` has been
+current GPU VM only after all workers finish and `captions.jsonl` has been
 atomically merged.
 
 The command is resumable. Relaunch the same command after interruption; completed

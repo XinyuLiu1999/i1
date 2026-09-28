@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
+import socket
 import stat
 import time
 from urllib import error, request
@@ -15,8 +17,17 @@ DEFAULT_COMPLETION_URL = (
 )
 
 
+def current_vm_id() -> str:
+    """This VM platform uses the machine's short hostname as its task-manager ID."""
+    vmid = socket.gethostname().split(".", 1)[0]
+    if (not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", vmid)
+            or vmid.lower() in {"localhost", "localhost6"}):
+        raise ValueError("Cannot determine the current VM ID from the machine hostname")
+    return vmid
+
+
 def load_completion_config(path: str | os.PathLike[str]) -> dict:
-    """Load task-manager credentials from a private JSON file."""
+    """Load private credentials and target only this VM; ignore stored vmids."""
     path = Path(path).expanduser().resolve()
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
@@ -28,17 +39,11 @@ def load_completion_config(path: str | os.PathLike[str]) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     name = value.get("name")
     password = value.get("password")
-    vmids = value.get("vmids")
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{path}: name must be a nonempty string")
     if not isinstance(password, str) or not password:
         raise ValueError(f"{path}: password must be a nonempty string")
-    if (not isinstance(vmids, list) or not vmids
-            or any(not isinstance(item, str) or not item.strip() for item in vmids)):
-        raise ValueError(f"{path}: vmids must be a nonempty list of nonempty strings")
-    if len(vmids) != len(set(vmids)):
-        raise ValueError(f"{path}: vmids contains duplicates")
-    return {"name": name.strip(), "password": password, "vmids": vmids}
+    return {"name": name.strip(), "password": password, "vmids": [current_vm_id()]}
 
 
 def notify_task_completion(config: dict, url: str = DEFAULT_COMPLETION_URL,

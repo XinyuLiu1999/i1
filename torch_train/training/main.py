@@ -53,7 +53,21 @@ def checkpoint_config(config, latent_size, text_embed_dim, text_num_tokens):
     )
 
 
-def main():
+def prepare_flow_microbatch(batch, sl, config, vae, text_encoder, device, rf_cfg):
+    """Shared encoder/noise/timestep path for training and gradient diagnostics."""
+    images = batch["image"][sl].to(device, non_blocking=True)
+    input_ids = batch["input_ids"][sl].to(device, non_blocking=True)
+    attention_mask = batch["attention_mask"][sl].to(device, non_blocking=True)
+    with torch.no_grad():
+        latents = encode_images_to_latents(vae, images)
+        latents = scale_latents(latents, config).float()
+        enc_hidden = encode_text_encoder(text_encoder, input_ids, attention_mask)
+    xt, ut, t = rectified_flow.prepare_rectified_flow_inputs(latents, rf_cfg)
+    return images, latents, enc_hidden, attention_mask, xt, ut, t
+
+
+def main(extension=None):
+    """Run shared SFT; an optional experiment supplies data, loss and provenance hooks."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--workdir", default=None)
@@ -74,7 +88,7 @@ def main():
                         help="Disable torch.compile and run model blocks eagerly.")
     parser.add_argument(
         "--completion-config", default=os.environ.get("GPU_TASK_COMPLETION_CONFIG"),
-        help="Mode-0600 JSON task-manager credentials; notify only after successful training.")
+        help="Mode-0600 JSON credentials (name/password); targets this VM's hostname after successful training.")
     parser.add_argument(
         "--completion-url", default=os.environ.get(
             "GPU_TASK_COMPLETION_URL", DEFAULT_COMPLETION_URL))
@@ -86,6 +100,8 @@ def main():
     parser.add_argument("--manifest", default=None,
                         help="JSONL manifest, Parquet shard, or GPT-Image output directory for bucketed SFT.")
     parser.add_argument("--token_len", type=int, default=None, help="Maximum caption tokens for a new training run.")
+    if extension is not None and hasattr(extension, "add_arguments"):
+        extension.add_arguments(parser)
     args = parser.parse_args()
 
     if args.completion_timeout <= 0 or args.completion_attempts <= 0:
@@ -132,6 +148,10 @@ def main():
     if args.no_compile:
         config.compile = False
     amp = config.get("amp", True)
+    if extension is not None:
+        extension.configure(config, args)
+    if args.completion_config and (not args.workdir or not config.save_ckpt):
+        raise ValueError("Automatic completion requires a workdir and checkpoint saving.")
 
     torch.set_float32_matmul_precision("high")
 
@@ -141,7 +161,8 @@ def main():
     if args.completion_config and dist_info.is_main:
         completion_config = load_completion_config(args.completion_config)
         log(f"will notify the GPU task manager after successful training using "
-            f"{Path(args.completion_config).expanduser().resolve()}")
+            f"{Path(args.completion_config).expanduser().resolve()}; "
+            f"current VM: {completion_config['vmids'][0]}")
     if dist_info.is_main:
         log(f"world_size={dist_info.world_size} data={dist_info.data_size} "
             f"fsdp={dist_info.fsdp_size} model={dist_info.model_size}")
@@ -162,7 +183,8 @@ def main():
     if bucketed:
         from datasets.bucketed import BucketedImages, bucket_steps_per_epoch, build_bucket_iterator
         multiple = VAE_CONFIGS[config.vae_type]["vae_compression_factor"] * config.patch_size
-        train_ds = BucketedImages(config.input, multiple=multiple)
+        dataset_class = BucketedImages if extension is None else extension.dataset_class
+        train_ds = dataset_class(config.input, multiple=multiple)
         if dist_info.is_main:
             log(f"SFT images: {len(train_ds)}; bucket counts: "
                 f"{dict(zip(train_ds.buckets, map(len, train_ds.groups)))}; filtered: {dict(train_ds.filtered)}")
@@ -184,6 +206,8 @@ def main():
         train_iter = input_pipeline.start_input_iterator(train_ds, tokenizer, token_len)
 
     vae = load_vae(config, device, dtype=torch.float32)
+    if extension is not None:
+        extension.setup(config, vae, device)
     vae_channels = VAE_CONFIGS[config.vae_type]["vae_channels"]
     latent_size = config.image_size // VAE_CONFIGS[config.vae_type]["vae_compression_factor"]
 
@@ -194,12 +218,16 @@ def main():
         if any(re.fullmatch(pat, name) for pat in config.freeze_patterns):
             p.requires_grad_(False)
     ckpt_cfg = checkpoint_config(config, latent_size, text_embed_dim, token_len)
+    if extension is not None:
+        ckpt_cfg["training_objective"] = extension.checkpoint_metadata(config, train_ds, dist_info)
 
     resume_ckpt = None
     if resume_path:
         if dist_info.is_main:
             log(f"resuming from {resume_path}")
         resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if extension is not None:
+            extension.validate_resume(resume_ckpt, ckpt_cfg["training_objective"])
         ckpt_lib.load_model_weights(model, resume_ckpt, dist_info)
     elif config.get("init_from"):
         init_ckpt = torch.load(config.init_from, map_location="cpu", weights_only=False)
@@ -217,6 +245,16 @@ def main():
     if config.get("compile", True):
         compile_blocks(model, dynamic=bucketed)
     model = parallelize(model, dist_info)
+
+    # Diagnostics share initialization and parallelization, but must never create
+    # optimizer/EMA state, resume training, save checkpoints, or notify completion.
+    if extension is not None and hasattr(extension, "run_diagnostics"):
+        extension.run_diagnostics(config, args, model, train_ds, text_encoder_bundle,
+                                  vae, dist_info, ckpt_cfg)
+        if dist_info.is_distributed:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+        return
 
     rf_cfg = rectified_flow.RectifiedFlowConfig.from_config(config.transport)
     mu_dtype = torch.bfloat16 if config.mu_dtype == "bfloat16" else torch.float32
@@ -256,8 +294,9 @@ def main():
     if total_steps is None or total_steps <= first_step:
         raise ValueError(f"total_steps={total_steps} must exceed resumed step={first_step}.")
     if bucketed:
-        train_iter = build_bucket_iterator(train_ds, config.input, tokenizer, token_len, dist_info,
-                                           total_steps, first_step, config.seed)
+        iterator_factory = build_bucket_iterator if extension is None else extension.build_iterator
+        train_iter = iterator_factory(train_ds, config.input, tokenizer, token_len, dist_info,
+                                      total_steps, first_step, config.seed)
 
     use_wandb = bool(config.wandb.log_wandb) and dist_info.is_main
     if use_wandb:
@@ -284,6 +323,8 @@ def main():
             keep_ckpt_steps=int(config.get("keep_ckpt_steps", 0) or 0),
             seed=int(config.seed),
         ))
+        if extension is not None:
+            wandb.config.update(dict(training_objective=ckpt_cfg["training_objective"]))
 
     if dist_info.is_main:
         log(f"training for {total_steps} steps | global_bs={global_bs} "
@@ -303,25 +344,28 @@ def main():
         ("input_ids", (per_rank_bs, token_len), torch.long),
         ("attention_mask", (per_rank_bs, token_len), torch.long),
     ]
+    if extension is not None:
+        batch_specs.extend(extension.batch_specs(per_rank_bs, config))
     for step in range(first_step + 1, total_steps + 1):
         batch = load_tp_batch(train_iter, dist_info, batch_specs, device)
         is_log_step = step % config.log_training_steps == 0
         step_loss = torch.zeros((), device=device)
+        extra_metrics = {}
         for micro in range(grad_accum):
             sl = slice(micro * micro_bs, (micro + 1) * micro_bs)
-            images = batch["image"][sl].to(device, non_blocking=True)
-            input_ids = batch["input_ids"][sl].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"][sl].to(device, non_blocking=True)
-
-            with torch.no_grad():
-                latents = encode_images_to_latents(vae, images)
-                latents = scale_latents(latents, config).float()
-                enc_hidden = encode_text_encoder(text_encoder, input_ids, attention_mask)
-
-            xt, ut, t = rectified_flow.prepare_rectified_flow_inputs(latents, rf_cfg)
+            images, latents, enc_hidden, attention_mask, xt, ut, t = prepare_flow_microbatch(
+                batch, sl, config, vae, text_encoder, device, rf_cfg)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 pred = model(xt, t, enc_hidden, attention_mask, train=True)
-                loss = F.mse_loss(pred.float(), ut.float())
+                if extension is None:
+                    loss = F.mse_loss(pred.float(), ut.float())
+                else:
+                    loss, loss_metrics = extension.loss(pred, ut, batch, sl,
+                                                       latents=latents, images=images)
+                    for key, value in loss_metrics.items():
+                        extra_metrics[key] = extra_metrics.get(key, 0) + value.detach() / grad_accum
+            if extension is not None and not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Nonfinite training loss at step {step}")
             if dist_info.is_distributed and grad_accum > 1 and hasattr(model, "set_requires_gradient_sync"):
                 model.set_requires_gradient_sync(micro == grad_accum - 1)
             (loss / grad_accum).backward()
@@ -336,6 +380,8 @@ def main():
         if is_log_step:
             if dist_info.is_distributed:
                 torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+                for value in extra_metrics.values():
+                    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.AVG)
             loss_val = step_loss.item()
             l2_params = optim_lib.global_l2_norm(p for p in model.parameters())
             l2_ema = optim_lib.global_l2_norm(ema.shadow.values()) if ema is not None else 0.0
@@ -349,11 +395,14 @@ def main():
                 "image_width": batch["image"].shape[2],
                 "caption_tokens_mean": batch["attention_mask"].float().sum(dim=1).mean().item(),
             }
+            metrics.update({key: value.item() for key, value in extra_metrics.items()})
             if dist_info.is_main:
                 imgs_per_s = config.log_training_steps * global_bs / (time.time() - t_start)
                 log(f"step {step}/{total_steps} loss {loss_val:.5f} "
                     f"l2_grads {metrics['l2_grads']:.3f} l2_updates {metrics['l2_updates']:.2e} "
                     f"imgs/s {imgs_per_s:.0f}")
+                if extra_metrics:
+                    log("objective: " + " ".join(f"{key}={metrics[key]:.5f}" for key in extra_metrics))
                 if use_wandb:
                     wandb.log({**metrics, "imgs_per_s": imgs_per_s}, step=step)
             t_start = time.time()

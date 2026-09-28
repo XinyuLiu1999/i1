@@ -18,6 +18,7 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
@@ -122,9 +123,15 @@ def tokenize_lengths(tokenizer, captions, batch_size=128):
     return lengths
 
 
+def caption_prefix_matches(caption, word, word_count=10):
+    """Case-insensitive whole-word match in the first N regex word tokens."""
+    return word.casefold() in re.findall(r"\b\w+\b", caption.casefold())[:word_count]
+
+
 def _part_signature(files, config, token_limit, tokenizer_name, max_shard_bytes,
-                    max_source_pixels, max_source_side):
-    return dict(
+                    max_source_pixels, max_source_side, reject_prefix_word=None,
+                    prefix_word_count=10):
+    result = dict(
         format="densetext-accepted-cache-v1",
         inputs=[dict(path=str(path), bytes=path.stat().st_size,
                      mtime_ns=path.stat().st_mtime_ns) for path in files],
@@ -132,10 +139,15 @@ def _part_signature(files, config, token_limit, tokenizer_name, max_shard_bytes,
         tokenizer=tokenizer_name, max_shard_bytes=max_shard_bytes,
         max_source_pixels=max_source_pixels, max_source_side=max_source_side,
     )
+    if reject_prefix_word is not None:
+        result["caption_prefix_filter"] = dict(word=reject_prefix_word, count=prefix_word_count,
+                                               tokenizer="unicode-regex-word-v1")
+    return result
 
 
 def _audit_export_part(files, output, ordinal, config, token_limit, tokenizer_name,
-                       max_shard_bytes, max_source_pixels, max_source_side):
+                       max_shard_bytes, max_source_pixels, max_source_side,
+                       reject_prefix_word=None, prefix_word_count=10):
     from transformers import AutoTokenizer
 
     started = time.monotonic()
@@ -144,7 +156,7 @@ def _audit_export_part(files, output, ordinal, config, token_limit, tokenizer_na
     part = output / "parts" / f"{ordinal:05d}"
     signature = _part_signature(
         files, config, token_limit, tokenizer_name, max_shard_bytes,
-        max_source_pixels, max_source_side)
+        max_source_pixels, max_source_side, reject_prefix_word, prefix_word_count)
     if (part / "complete.json").exists():
         report = json.loads((part / "complete.json").read_text())
         if report["signature"] != signature:
@@ -200,6 +212,10 @@ def _audit_export_part(files, output, ordinal, config, token_limit, tokenizer_na
                                 caption_status=row.get("caption_status")))
                         elif not isinstance(caption, str) or not caption.strip():
                             preliminary_reasons[uid] = ("empty_caption", {})
+                        elif (reject_prefix_word is not None and caption_prefix_matches(
+                                caption, reject_prefix_word, prefix_word_count)):
+                            preliminary_reasons[uid] = ("caption_prefix_word", dict(
+                                word=reject_prefix_word, first_words=prefix_word_count))
                         elif row.get("image_decode_error"):
                             preliminary_reasons[uid] = ("gpu_image_decode_error", dict(
                                 error=row.get("image_decode_error")))
@@ -438,10 +454,15 @@ def precompute_captioned(source, output, config, workers=8, token_limit=1024,
                          tokenizer_name="google/t5gemma-2b-2b-ul2-it",
                          records_per_part=2000, max_shard_bytes=256 * 1024**2,
                          max_source_pixels=DEFAULT_MAX_SOURCE_PIXELS,
-                         max_source_side=DEFAULT_MAX_SOURCE_SIDE):
+                         max_source_side=DEFAULT_MAX_SOURCE_SIDE, *,
+                         reject_prefix_word=None, prefix_word_count=10):
     if min(workers, token_limit, records_per_part, max_shard_bytes,
            max_source_pixels, max_source_side) <= 0:
         raise ValueError("worker, token, shard, and source-size limits must be positive")
+    if reject_prefix_word is not None:
+        if not re.fullmatch(r"\w+", reject_prefix_word) or prefix_word_count <= 0:
+            raise ValueError("caption filter requires one word and a positive prefix length")
+        reject_prefix_word = reject_prefix_word.casefold()
     source = Path(source).expanduser().resolve()
     output = Path(output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -455,6 +476,9 @@ def precompute_captioned(source, output, config, workers=8, token_limit=1024,
         records_per_part=records_per_part, max_shard_bytes=max_shard_bytes,
         max_source_pixels=max_source_pixels, max_source_side=max_source_side,
     )
+    if reject_prefix_word is not None:
+        specification["caption_prefix_filter"] = dict(
+            word=reject_prefix_word, count=prefix_word_count, tokenizer="unicode-regex-word-v1")
     settings = output / "settings.json"
     if settings.exists() and json.loads(settings.read_text()) != specification:
         raise ValueError("cache output has different settings; use a new output directory")
@@ -470,7 +494,7 @@ def precompute_captioned(source, output, config, workers=8, token_limit=1024,
             reports[ordinal] = _audit_export_part(
                 [str(path) for path in group], str(output), ordinal, dict(config),
                 token_limit, tokenizer_name, max_shard_bytes,
-                max_source_pixels, max_source_side)
+                max_source_pixels, max_source_side, reject_prefix_word, prefix_word_count)
             print(f"completed {len(reports)}/{len(groups)} parts; inspected "
                   f"{sum(report['inspected'] for report in reports.values())}; accepted "
                   f"{sum(report['count'] for report in reports.values())}", flush=True)
@@ -480,7 +504,8 @@ def precompute_captioned(source, output, config, workers=8, token_limit=1024,
             futures = {
                 executor.submit(_audit_export_part, [str(path) for path in group], str(output), ordinal,
                                 dict(config), token_limit, tokenizer_name, max_shard_bytes,
-                                max_source_pixels, max_source_side): ordinal
+                                max_source_pixels, max_source_side,
+                                reject_prefix_word, prefix_word_count): ordinal
                 for ordinal, group in enumerate(groups)
             }
             for future in as_completed(futures):

@@ -9,15 +9,29 @@ import math
 
 def select_bucket(height, width, config):
     """Return a bucket index or an exclusion reason under the training policy."""
+    resolutions = config.get("bucket_resolutions")
+    if resolutions is not None:
+        if len(resolutions) != len(config["buckets"]) or any(
+            not isinstance(r, int) or r <= 0 or bh * bw > r * r
+            for r, (bh, bw) in zip(resolutions, config["buckets"])
+        ):
+            raise ValueError("bucket_resolutions must give a positive pixel-budget side for every bucket.")
     if width * height < config.get("min_image_area", 0) or min(width, height) < config.get("min_image_side", 0):
         return None, "source_too_small"
     resize_scale = min if config.get("resize_mode", "pad") == "pad" else max
     candidates = []
     for index, (bh, bw) in enumerate(config["buckets"]):
+        # Mixed-resolution experiments first choose the largest tier supported
+        # by the source area, then minimize padding within that tier. Otherwise
+        # an exact-aspect 1024 bucket can win even for a 2048 source image.
+        if resolutions is not None and height * width < resolutions[index] ** 2:
+            continue
         if not config.get("allow_upscale", False) and resize_scale(bh / height, bw / width) > 1.0:
             continue
         # Prefer matching aspect ratios, then the largest eligible area.
         score = (abs(math.log((bw / bh) / (width / height))), -bh * bw)
+        if resolutions is not None:
+            score = (-resolutions[index], *score)
         candidates.append((score, index))
     if not candidates:
         return None, "no_bucket_without_upscaling"

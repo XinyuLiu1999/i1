@@ -9,12 +9,16 @@ import PIL
 
 
 def transform_spec(config):
-    return dict(version=1, buckets=[list(shape) for shape in config['buckets']],
+    spec = dict(version=1, buckets=[list(shape) for shape in config['buckets']],
                 resize_mode=config.get('resize_mode', 'pad'),
                 allow_upscale=config.get('allow_upscale', False),
                 min_image_area=config.get('min_image_area', 0),
                 min_image_side=config.get('min_image_side', 0),
                 resampling='PIL.LANCZOS', padding=[255, 255, 255], pillow=PIL.__version__)
+    # Preserve existing cache fingerprints when using the original policy.
+    if config.get('bucket_resolutions') is not None:
+        spec['bucket_resolutions'] = list(config['bucket_resolutions'])
+    return spec
 
 
 def fingerprint(config):

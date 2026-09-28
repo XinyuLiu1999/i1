@@ -4,6 +4,8 @@ This folder contains the PyTorch reimplementation of the i1 model training code.
 
 For checkpoint-initialized SFT with rectangular image buckets and long captions,
 see [the SFT guide](SFT.md) and `configs/sft_512.py` / `configs/sft_1024.py`.
+For mixed 1024/1536/2048 pixel-budget training, see the
+[high-resolution bucket experiment](../experiments/2026-09-22_high_resolution/README.md).
 
 ## 1. Environment Setup
 ```bash

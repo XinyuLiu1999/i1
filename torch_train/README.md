@@ -2,6 +2,10 @@
 
 This folder contains the PyTorch reimplementation of the i1 model training code.
 
+For platform-launched multi-node SFT, see [the multi-node guide](MULTINODE.md)
+and `run_multinode.sh`. The launcher maps platform node ranks to torchrun,
+validates global batch/FSDP settings, and includes a model-free NCCL check.
+
 For checkpoint-initialized SFT with rectangular image buckets and long captions,
 see [the SFT guide](SFT.md) and `configs/sft_512.py` / `configs/sft_1024.py`.
 For mixed 1024/1536/2048 pixel-budget training, see the

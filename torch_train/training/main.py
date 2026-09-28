@@ -301,7 +301,8 @@ def main(extension=None):
     use_wandb = bool(config.wandb.log_wandb) and dist_info.is_main
     if use_wandb:
         import wandb
-        wandb.init(project=str(config.wandb.project), name=str(config.wandb.experiment))
+        wandb.init(project=os.environ.get("WANDB_PROJECT") or str(config.wandb.project),
+                   name=str(config.wandb.experiment))
         wandb.config.update(dict(
             total_steps=total_steps,
             configured_epochs=(configured_epochs if epoch_stop_active else None),

@@ -23,8 +23,15 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-/user/lxy8802/.cache/data_juicer/models}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 unset TRANSFORMERS_CACHE
-# W&B: fill in a key here or provide it through the platform environment.
-# An empty key also allows credentials previously saved by `wandb login`.
+# W&B: an environment key wins; otherwise read the `export WANDB_API_KEY=...`
+# line from WANDB_KEY_FILE. That .bashrc returns early in non-interactive
+# shells, so parse the one line instead of sourcing it. An empty key still
+# allows credentials previously saved by `wandb login`.
+WANDB_KEY_FILE=${WANDB_KEY_FILE:-/user/lxy8802/.bashrc}
+if [[ -z ${WANDB_API_KEY:-} && -r $WANDB_KEY_FILE ]]; then
+  WANDB_API_KEY=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?WANDB_API_KEY=[\"']?([^\"'[:space:]]*)[\"']?.*/\2/p" \
+    "$WANDB_KEY_FILE" | tail -n 1)
+fi
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-DenseText-SFT}"
 export WANDB_MODE="${WANDB_MODE:-online}"

@@ -19,16 +19,20 @@ def _is_dtensor(x) -> bool:
     return isinstance(x, DTensor)
 
 
-def _gather_full(t):
+def _gather_full(t, keep=True):
+    # full_tensor() is a collective and must run on every rank, but only the
+    # writing rank keeps a host copy; the others release each gathered tensor.
     if _is_dtensor(t):
-        return t.full_tensor().detach().cpu()
-    return t.detach().cpu()
+        t = t.full_tensor()
+    return t.detach().cpu() if keep else None
 
 
-def _gather_named(named: dict, tp_size: int, permuted_keys) -> dict:
-    out = {}
+def _gather_named(named: dict, tp_size: int, permuted_keys, keep=True) -> dict | None:
+    out = {} if keep else None
     for k, v in named.items():
-        full = _gather_full(v)
+        full = _gather_full(v, keep)
+        if not keep:
+            continue
         if tp_size > 1 and k in permuted_keys:
             full = _unpermute_gate_up(full, tp_size)
         out[k] = full
@@ -112,11 +116,12 @@ def load_train_states(ema, optimizer, ckpt, dist_info, permuted_keys=None):
 def save_checkpoint(path, model, ema, optimizer, step, ckpt_cfg, dist_info, step_copy=None):
     tp = dist_info.model_size
     permuted = getattr(model, "_tp_permuted_keys", set())
-    model_sd = _gather_named(dict(model.state_dict()), tp, permuted)
-    ema_sd = _gather_named(ema.shadow, tp, permuted) if ema is not None else None
-    opt_mu = _gather_named(optimizer.mu, tp, permuted)
-    opt_nu = _gather_named(optimizer.nu, tp, permuted)
-    if not dist_info.is_main:
+    keep = dist_info.is_main
+    model_sd = _gather_named(dict(model.state_dict()), tp, permuted, keep)
+    ema_sd = _gather_named(ema.shadow, tp, permuted, keep) if ema is not None else None
+    opt_mu = _gather_named(optimizer.mu, tp, permuted, keep)
+    opt_nu = _gather_named(optimizer.nu, tp, permuted, keep)
+    if not keep:
         return
     inference_sd = ema_sd if ema_sd is not None else model_sd
     train_state = {"step": step, "opt": {"count": optimizer.count, "mu": opt_mu, "nu": opt_nu}}

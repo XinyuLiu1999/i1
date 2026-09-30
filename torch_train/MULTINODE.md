@@ -27,8 +27,9 @@ i1 的 `training.parallel.init_distributed()` 已使用全局 rank 建立 FSDP/T
   NCCL 还需要节点间数据通信，只有 rendezvous 端口可达并不足够。
 
 重启后先重新激活环境，并重新设置下面的变量。建议将它们保存为平台的任务启动脚本。
-W&B 默认在线开启。API key 可在启动脚本的配置处填写，或通过平台环境变量注入；
-也可使用之前 `wandb login` 保存的凭据。在线训练启动前，仅节点 0 自动执行
+W&B 默认在线开启。API key 优先使用平台注入的 `WANDB_API_KEY`；未设置时，脚本从
+`WANDB_KEY_FILE`（默认 `/user/lxy8802/.bashrc`）中读取 `export WANDB_API_KEY=...` 这一行
+（只解析该行，不 source 整个文件，也不打印 key）；两者都没有时，使用之前 `wandb login` 保存的凭据。在线训练启动前，仅节点 0 自动执行
 `python -m wandb login --verify`，读取 `WANDB_API_KEY` 或已有凭据；验证失败会退出，
 不会等待交互输入。命令预览、通信检查及 offline/disabled 模式跳过登录。
 项目名由 `WANDB_PROJECT` 指定，优先于训练配置中的项目名。
@@ -56,7 +57,6 @@ export SFT_WORKDIR=/shared/outputs/i1_multinode_run001
 export GPUS_PER_NODE=4
 export GLOBAL_BATCH_SIZE=32
 export GRAD_ACCUM=4
-export WANDB_API_KEY="${WANDB_API_KEY:-}"  # 可填写 API key，或沿用平台注入的值
 export WANDB_PROJECT="${WANDB_PROJECT:-DenseText-SFT}"
 export WANDB_MODE=online  # 离线测试时可改为 offline
 

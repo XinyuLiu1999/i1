@@ -181,7 +181,8 @@ def main(extension=None):
 
     bucketed = config.input.get("type", "tfrecord") == "bucketed"
     if bucketed:
-        from datasets.bucketed import BucketedImages, bucket_steps_per_epoch, build_bucket_iterator
+        from datasets.bucketed import (BucketedImages, bucket_remainder_counts, bucket_steps_per_epoch,
+                                       build_bucket_iterator)
         multiple = VAE_CONFIGS[config.vae_type]["vae_compression_factor"] * config.patch_size
         dataset_class = BucketedImages if extension is None else extension.dataset_class
         train_ds = dataset_class(config.input, multiple=multiple)
@@ -282,7 +283,12 @@ def main(extension=None):
     micro_bs = per_rank_bs // grad_accum
     sampler_steps_per_epoch = None
     if bucketed:
-        sampler_steps_per_epoch = bucket_steps_per_epoch(train_ds.groups, global_bs)
+        drop_remainder = config.input.get("drop_remainder", False)
+        sampler_steps_per_epoch = bucket_steps_per_epoch(train_ds.groups, global_bs, drop_remainder)
+        if drop_remainder and dist_info.is_main:
+            dropped, never = bucket_remainder_counts(train_ds.groups, global_bs)
+            log(f"drop_remainder: {dropped} images omitted per epoch (reshuffled each epoch), "
+                f"including {never} in buckets smaller than one global batch that are never used")
     configured_epochs = config.get("num_epochs", None) if bucketed else None
     epoch_stop_active = configured_epochs is not None and args.total_steps is None
     if epoch_stop_active:
@@ -410,10 +416,11 @@ def main(extension=None):
 
         if save_ckpt_path and config.save_ckpt:
             keep_ckpt_steps = config.get("keep_ckpt_steps", None)
-            save_now = itstime(step, config.ckpt_steps, total_steps) or (
-                keep_ckpt_steps and itstime(step, keep_ckpt_steps, total_steps))
+            # No step-1 save: it would only duplicate the initialization weights.
+            keep_now = bool(keep_ckpt_steps) and itstime(step, keep_ckpt_steps, total_steps, first=False)
+            save_now = itstime(step, config.ckpt_steps, total_steps, first=False) or keep_now
             if save_now:
-                copy_step = step if (keep_ckpt_steps and itstime(step, keep_ckpt_steps, total_steps)) else None
+                copy_step = step if keep_now else None
                 ckpt_lib.save_checkpoint(save_ckpt_path, model, ema, optimizer, step, ckpt_cfg, dist_info,
                                          step_copy=copy_step)
 

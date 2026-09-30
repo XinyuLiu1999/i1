@@ -29,5 +29,7 @@ def get_config():
         allow_upscale=False,
         resize_mode="pad",  # Preserve all text; white letterbox padding.
         caption_overflow="error",
+        # Omit each bucket's partial tail batch instead of filling it with repeats.
+        drop_remainder=True,
     ))
     return config

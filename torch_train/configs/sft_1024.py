@@ -10,7 +10,7 @@ def get_config():
     config.total_steps = None
     config.log_training_steps = 50
     config.ckpt_steps = 1000
-    config.keep_ckpt_steps = 2500
+    config.keep_ckpt_steps = 10000
     # The pretraining value (0.9999) retains too much of the initialization in a
     # short SFT run. This decay has an effective averaging window near 2K updates.
     config.ema_decay_rate = 0.9995

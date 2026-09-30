@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .captions import tokenize_captions
 from .data_sources import iter_image_records, open_record_image
-from .image_geometry import select_bucket
+from .image_geometry import BucketSelector
 from .pixel_cache import cached_pixels, fingerprint
 
 
@@ -38,6 +38,8 @@ class BucketedImages(Dataset):
         if not source:
             raise ValueError("Set --manifest or config.input.manifest; use a corrected index for GPT-Image-200K.")
         expected_fingerprint = fingerprint(config)
+        # Source sizes repeat heavily; the policy is a pure function of (height, width).
+        select_bucket, selections = BucketSelector(config), {}
         for record in iter_image_records(source, image_root=config.get("image_root")):
             if record.cache_path is not None and record.transform_fingerprint != expected_fingerprint:
                 raise ValueError(f"Pixel cache transform mismatch for {record.identifier}; use its original config or rebuild.")
@@ -48,7 +50,10 @@ class BucketedImages(Dataset):
                 width, height = record.width, record.height
             if width <= 0 or height <= 0:
                 raise ValueError(f"Invalid image dimensions for {record.identifier}.")
-            bucket, exclusion = select_bucket(height, width, config)
+            selection = selections.get((height, width))
+            if selection is None:
+                selection = selections[height, width] = select_bucket(height, width)
+            bucket, exclusion = selection
             if exclusion is not None:
                 self.filtered[exclusion] += 1
                 continue
@@ -99,27 +104,41 @@ class BucketedImages(Dataset):
         return image
 
 
-def bucket_steps_per_epoch(groups, global_batch_size):
+def bucket_steps_per_epoch(groups, global_batch_size, drop_remainder=False):
     if global_batch_size <= 0:
         raise ValueError("Global batch must be positive.")
+    if drop_remainder:
+        return sum(len(group) // global_batch_size for group in groups)
     return sum((len(group) + global_batch_size - 1) // global_batch_size
                for group in groups if len(group))
 
 
+def bucket_remainder_counts(groups, global_batch_size):
+    """Images left out of each epoch, and images whose bucket never fills a batch."""
+    dropped = sum(len(group) % global_batch_size for group in groups)
+    never = sum(len(group) for group in groups if len(group) < global_batch_size)
+    return dropped, never
+
+
 class BucketBatchSampler(Sampler):
-    def __init__(self, groups, global_batch_size, rank, world_size, total_steps, start_step=0, seed=0):
+    def __init__(self, groups, global_batch_size, rank, world_size, total_steps, start_step=0, seed=0,
+                 drop_remainder=False):
         if not 0 <= rank < world_size or global_batch_size <= 0 or global_batch_size % world_size:
             raise ValueError("Global batch must be positive and divisible by the data-parallel world size.")
         if seed < 0 or not 0 <= start_step <= total_steps:
             raise ValueError("Invalid seed or step range.")
-        self.groups = [np.asarray(g, dtype=np.int64) for g in groups if len(g)]
+        # With drop_remainder, each epoch omits a freshly shuffled tail of every
+        # bucket instead of filling it with duplicates; the plan stays seed-pure.
+        minimum = global_batch_size if drop_remainder else 1
+        self.groups = [np.asarray(g, dtype=np.int64) for g in groups if len(g) >= minimum]
         if not self.groups:
-            raise ValueError("No nonempty buckets.")
+            raise ValueError("No bucket can fill a global batch." if drop_remainder else "No nonempty buckets.")
         self.global_bs = global_batch_size
         self.local_bs = global_batch_size // world_size
         self.rank, self.seed = rank, seed
+        self.drop_remainder = drop_remainder
         self.start_step, self.total_steps = start_step, total_steps
-        self.steps_per_epoch = bucket_steps_per_epoch(self.groups, self.global_bs)
+        self.steps_per_epoch = bucket_steps_per_epoch(self.groups, self.global_bs, drop_remainder)
 
     def __len__(self):
         return self.total_steps - self.start_step
@@ -129,6 +148,11 @@ class BucketBatchSampler(Sampler):
         for group_index, group in enumerate(self.groups):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, epoch, group_index]))
             shuffled = group[rng.permutation(len(group))]
+            if self.drop_remainder:
+                batch_count = len(group) // self.global_bs
+                shuffled = shuffled[:batch_count * self.global_bs]
+                batches.extend(shuffled.reshape(batch_count, self.global_bs))
+                continue
             batch_count = (len(group) + self.global_bs - 1) // self.global_bs
             padded_size = batch_count * self.global_bs
             if padded_size > len(shuffled):
@@ -165,7 +189,8 @@ def collate_images(samples):
 
 def build_bucket_iterator(dataset, config, tokenizer, token_len, dist_info, total_steps, start_step, seed):
     sampler = BucketBatchSampler(dataset.groups, config["batch_size"], dist_info.dp_rank,
-                                 dist_info.dp_world, total_steps, start_step, seed)
+                                 dist_info.dp_world, total_steps, start_step, seed,
+                                 drop_remainder=config.get("drop_remainder", False))
     workers = config.get("num_workers", 4)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=workers, collate_fn=collate_images,
                         pin_memory=dist_info.device.type == "cuda", persistent_workers=workers > 0,

@@ -115,6 +115,16 @@ def _read_parquet_records(path):
 
 def _iter_jsonl(path, image_root=None):
     root = Path(image_root).expanduser().resolve() if image_root else path.parent
+    resolved = {}
+
+    def resolve_relative(value):
+        # Many records share one cache or Parquet file; resolve() stats every
+        # path component, which is slow on network filesystems.
+        if value not in resolved:
+            target = Path(value).expanduser()
+            resolved[value] = str((target if target.is_absolute() else path.parent / target).resolve())
+        return resolved[value]
+
     with path.open() as handle:
         for line_no, line in enumerate(handle, 1):
             if not line.strip():
@@ -130,13 +140,11 @@ def _iter_jsonl(path, image_root=None):
                         raise ValueError(f'{path}:{line_no}: invalid or missing {key}.')
                 if not record.get('transform_fingerprint') or not record.get('id'):
                     raise ValueError(f'{path}:{line_no}: cached images require id and transform_fingerprint.')
-                cache_path = Path(record['cache_path']).expanduser()
-                if not cache_path.is_absolute():
-                    cache_path = path.parent / cache_path
+                cache_path = resolve_relative(record['cache_path'])
                 yield ImageRecord(
                     identifier=str(record['id']), caption=caption,
                     width=record['width'], height=record['height'],
-                    cache_path=str(cache_path.resolve()), cache_offset=record['cache_offset'],
+                    cache_path=cache_path, cache_offset=record['cache_offset'],
                     cache_height=record['cache_height'], cache_width=record['cache_width'],
                     transform_fingerprint=record['transform_fingerprint'],
                 )
@@ -144,9 +152,7 @@ def _iter_jsonl(path, image_root=None):
             if "parquet_path" in record:
                 if "image_path" in record:
                     raise ValueError(f"{path}:{line_no}: specify image_path or parquet_path, not both.")
-                parquet_path = Path(record["parquet_path"]).expanduser()
-                if not parquet_path.is_absolute():
-                    parquet_path = path.parent / parquet_path
+                parquet_path = resolve_relative(record["parquet_path"])
                 for key in ("width", "height", "row_group", "row_in_group"):
                     value = record.get(key)
                     minimum = 1 if key in ("width", "height") else 0
@@ -157,7 +163,7 @@ def _iter_jsonl(path, image_root=None):
                 yield ImageRecord(
                     identifier=record["id"], caption=caption,
                     width=record["width"], height=record["height"],
-                    parquet_path=str(parquet_path.resolve()),
+                    parquet_path=parquet_path,
                     row_group=record["row_group"], row_in_group=record["row_in_group"],
                 )
                 continue

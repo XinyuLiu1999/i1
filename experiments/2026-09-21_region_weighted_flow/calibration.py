@@ -215,7 +215,8 @@ class RegionCalibration(RegionFlow):
         # Replay only the sampler indices to audit sources/IDs without changing the
         # production dataset, collator, padding, or frequency of empty masks.
         audit_sampler = BucketBatchSampler(dataset.groups, config.input.batch_size, 0, 1,
-                                           count, 0, config.seed)
+                                           count, 0, config.seed,
+                                           drop_remainder=config.input.get("drop_remainder", False))
         sources = []
         with Path(config.input.manifest).open() as handle:
             for line in handle:

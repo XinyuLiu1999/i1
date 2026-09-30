@@ -81,7 +81,8 @@ def collate_regions(samples):
 
 def build_iterator(dataset, config, tokenizer, token_len, dist_info, total_steps, start_step, seed):
     sampler = BucketBatchSampler(dataset.groups, config["batch_size"], dist_info.dp_rank,
-                                 dist_info.dp_world, total_steps, start_step, seed)
+                                 dist_info.dp_world, total_steps, start_step, seed,
+                                 drop_remainder=config.get("drop_remainder", False))
     workers = config.get("num_workers", 4)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=workers,
                         collate_fn=collate_regions, pin_memory=dist_info.device.type == "cuda",

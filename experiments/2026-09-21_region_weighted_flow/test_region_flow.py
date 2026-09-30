@@ -104,7 +104,7 @@ class RegionTests(unittest.TestCase):
                           config.tensor_parallel_size, config.grad_accum_steps), (32, 8, 1, 1))
         self.assertEqual((config.num_epochs, config.total_steps), (1, None))
         self.assertEqual((config.lr, config.ema_decay_rate), (1e-5, .9995))
-        self.assertEqual((config.log_training_steps, config.ckpt_steps, config.keep_ckpt_steps), (50, 1000, 2500))
+        self.assertEqual((config.log_training_steps, config.ckpt_steps, config.keep_ckpt_steps), (50, 1000, 10000))
         self.assertEqual(config.transport.train_timestep_shift, .3)
         self.assertTrue(config.amp and config.use_grad_ckpt)
         self.assertFalse(config.compile)

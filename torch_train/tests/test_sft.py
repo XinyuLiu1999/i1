@@ -13,14 +13,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "torch_train"))
 from models.dit import DualStreamDiTConfig, i1DiT
-from datasets.bucketed import BucketedImages, BucketBatchSampler, bucket_steps_per_epoch, build_bucket_iterator
+from datasets.bucketed import (BucketedImages, BucketBatchSampler, bucket_remainder_counts, bucket_steps_per_epoch,
+                               build_bucket_iterator)
 from datasets.data_sources import iter_image_records, open_record_image
 from datasets.validate_images import _validate_shard
 from datasets.captions import tokenize_captions
+from training import checkpoint as ckpt_lib
 from training.checkpoint import load_model_weights, load_train_states, resolve_resume_path, save_checkpoint
 from training.parallel import DistInfo, load_tp_batch
 from training.optim import Adam, EMA
 from diffusion.rectified_flow import RectifiedFlowConfig, prepare_rectified_flow_inputs
+from utils.common import itstime
 
 spec = importlib.util.spec_from_file_location("i1_inference", ROOT / "torch_inference/generate.py")
 inference = importlib.util.module_from_spec(spec)
@@ -278,6 +281,37 @@ class DataTests(unittest.TestCase):
 
         resumed = list(BucketBatchSampler(groups, 4, 0, 1, 10, start_step=5, seed=7))
         self.assertEqual(resumed, batches[5:])
+
+    def test_drop_remainder_sampler_has_no_duplicates_and_resumes(self):
+        groups = [list(range(10)), list(range(100, 103)), list(range(200, 208)), []]
+        self.assertEqual(bucket_steps_per_epoch(groups, 4, drop_remainder=True), 4)
+        self.assertEqual(bucket_remainder_counts(groups, 4), (5, 3))
+        sampler = BucketBatchSampler(groups, 4, 0, 1, 12, seed=3, drop_remainder=True)
+        self.assertEqual(sampler.steps_per_epoch, 4)
+        batches = list(sampler)
+        for epoch in range(3):
+            epoch_batches = batches[epoch * 4:(epoch + 1) * 4]
+            seen = [index for batch in epoch_batches for index in batch]
+            self.assertEqual(len(seen), len(set(seen)))
+            self.assertTrue(set(range(200, 208)).issubset(seen))
+            self.assertFalse(set(range(100, 103)) & set(seen))
+            self.assertEqual(len(set(seen) & set(range(10))), 8)
+        for world in (1, 2, 4):
+            for start in range(13):
+                ranks = [list(BucketBatchSampler(groups, 4, rank, world, 12, start_step=start,
+                                                 seed=3, drop_remainder=True)) for rank in range(world)]
+                self.assertEqual([[i for rank in ranks for i in rank[step]] for step in range(12 - start)],
+                                 batches[start:])
+        with self.assertRaises(ValueError):
+            BucketBatchSampler([list(range(3))], 4, 0, 1, 1, drop_remainder=True)
+
+    def test_checkpoint_skips_step_one_and_host_copies_only_on_main(self):
+        self.assertFalse(itstime(1, 1000, 5000, first=False))
+        self.assertTrue(itstime(1000, 1000, 5000, first=False))
+        self.assertTrue(itstime(5000, 1000, 5000, first=False))
+        named = {"w": torch.ones(2, 3)}
+        self.assertIsNone(ckpt_lib._gather_named(named, 1, set(), keep=False))
+        self.assertTrue(torch.equal(ckpt_lib._gather_named(named, 1, set())["w"], named["w"]))
 
     def test_distributed_sampler_small_buckets_and_every_resume_offset(self):
         groups = [[], list(range(3)), list(range(10, 18)),

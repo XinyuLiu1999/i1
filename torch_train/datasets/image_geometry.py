@@ -7,35 +7,55 @@ All shapes in this module use (height, width), not PIL's (width, height).
 import math
 
 
+class BucketSelector:
+    """Validate a bucket policy once, then select buckets for many source sizes."""
+
+    def __init__(self, config):
+        buckets = config["buckets"]
+        resolutions = config.get("bucket_resolutions")
+        if resolutions is not None:
+            if len(resolutions) != len(buckets) or any(
+                not isinstance(r, int) or r <= 0 or bh * bw > r * r
+                for r, (bh, bw) in zip(resolutions, buckets)
+            ):
+                raise ValueError("bucket_resolutions must give a positive pixel-budget side for every bucket.")
+        self.min_area = config.get("min_image_area", 0)
+        self.min_side = config.get("min_image_side", 0)
+        self.pad = config.get("resize_mode", "pad") == "pad"
+        self.allow_upscale = config.get("allow_upscale", False)
+        self.buckets = [(index, bh, bw, bw / bh, -bh * bw,
+                         None if resolutions is None else resolutions[index])
+                        for index, (bh, bw) in enumerate(buckets)]
+
+    def __call__(self, height, width):
+        """Return a bucket index or an exclusion reason under the training policy."""
+        if width * height < self.min_area or min(width, height) < self.min_side:
+            return None, "source_too_small"
+        resize_scale = min if self.pad else max
+        aspect = width / height
+        best = None
+        for index, bh, bw, bucket_aspect, negative_area, resolution in self.buckets:
+            # Mixed-resolution experiments first choose the largest tier supported
+            # by the source area, then minimize padding within that tier. Otherwise
+            # an exact-aspect 1024 bucket can win even for a 2048 source image.
+            if resolution is not None and height * width < resolution ** 2:
+                continue
+            if not self.allow_upscale and resize_scale(bh / height, bw / width) > 1.0:
+                continue
+            # Prefer matching aspect ratios, then the largest eligible area.
+            score = (abs(math.log(bucket_aspect / aspect)), negative_area, index)
+            if resolution is not None:
+                score = (-resolution, *score)
+            if best is None or score < best:
+                best = score
+        if best is None:
+            return None, "no_bucket_without_upscaling"
+        return best[-1], None
+
+
 def select_bucket(height, width, config):
     """Return a bucket index or an exclusion reason under the training policy."""
-    resolutions = config.get("bucket_resolutions")
-    if resolutions is not None:
-        if len(resolutions) != len(config["buckets"]) or any(
-            not isinstance(r, int) or r <= 0 or bh * bw > r * r
-            for r, (bh, bw) in zip(resolutions, config["buckets"])
-        ):
-            raise ValueError("bucket_resolutions must give a positive pixel-budget side for every bucket.")
-    if width * height < config.get("min_image_area", 0) or min(width, height) < config.get("min_image_side", 0):
-        return None, "source_too_small"
-    resize_scale = min if config.get("resize_mode", "pad") == "pad" else max
-    candidates = []
-    for index, (bh, bw) in enumerate(config["buckets"]):
-        # Mixed-resolution experiments first choose the largest tier supported
-        # by the source area, then minimize padding within that tier. Otherwise
-        # an exact-aspect 1024 bucket can win even for a 2048 source image.
-        if resolutions is not None and height * width < resolutions[index] ** 2:
-            continue
-        if not config.get("allow_upscale", False) and resize_scale(bh / height, bw / width) > 1.0:
-            continue
-        # Prefer matching aspect ratios, then the largest eligible area.
-        score = (abs(math.log((bw / bh) / (width / height))), -bh * bw)
-        if resolutions is not None:
-            score = (-resolutions[index], *score)
-        candidates.append((score, index))
-    if not candidates:
-        return None, "no_bucket_without_upscaling"
-    return min(candidates)[1], None
+    return BucketSelector(config)(height, width)
 
 
 def generate_buckets(resolution, step=32, max_ratio=3.0, extra_shapes=()):

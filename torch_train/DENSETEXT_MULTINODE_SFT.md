@@ -406,6 +406,34 @@ saved step.
 
 ## 10. Evaluate
 
+### BizGenEval on a single CUDA machine (`i1_sft`)
+
+Use the saved checkpoint directly, with one inference worker per local GPU.
+This can run on a separate evaluation machine; copy/mount the checkpoint and
+the T5Gemma / FLUX.2 caches there first. The launcher uses `conda run -n i1_sft`
+for generation and evaluation. It defaults to a sibling `BizGenEval` checkout;
+set `BIZGENEVAL_ROOT` if it lives elsewhere.
+
+```bash
+export BIZGENEVAL_ROOT=/path/to/BizGenEval
+export SFT_CHECKPOINT=$SFT_WORKDIR/checkpoint.pt-000010000
+export OUTPUT_ROOT=$SFT_WORKDIR/bizgeneval/step10000_1024
+export GEMINI_API_KEY=your-key
+conda run -n i1_sft python -m pip install google-genai pyyaml requests
+bash $I1/../benchmark_eval/bizgeneval/run_densetext.sh
+# Optional: --gpu-ids 0,1,2,3 (default: all visible local GPUs)
+# Mixed-resolution checkpoint: --resolution 2048 --output-root /shared/eval/step10000_2048
+```
+
+GPU parallelism applies to image generation; the official Gemini judge uses API
+concurrency. Use `--stage generate` without an API key, then `--stage evaluate`
+with the same settings to score later. Use a separate output directory for a
+smoke test (`--limit 4 --num-steps 2`) or changed sampling settings. See
+[`benchmark_eval/bizgeneval/DENSETEXT.md`](../benchmark_eval/bizgeneval/DENSETEXT.md)
+for dependencies, resume rules, token limits, and reports.
+
+### Held-out samples and older comparison scripts
+
 Kept copies `checkpoint.pt-0000N0000` and `checkpoint.pt` load directly in
 inference, which uses the EMA weights. From `i1/torch_inference`:
 

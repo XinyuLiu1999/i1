@@ -88,14 +88,15 @@ def main(args):
     torch.set_grad_enabled(False)
     dist.init_process_group("nccl", timeout=timedelta(hours=1))
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    device = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+    torch.cuda.set_device(device)
     world_size = dist.get_world_size()
     seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    prompt_file = 'text_prompts.jsonl' if args.mode == 'en' else 'text_prompts_zh.jsonl'
+    prompt_file = args.prompt_file or ('text_prompts.jsonl' if args.mode == 'en' else 'text_prompts_zh.jsonl')
     prompts = [json.loads(line) for line in open(prompt_file)]
     prompt_map = {p['prompt_id']: p for p in prompts}
 
@@ -119,6 +120,7 @@ def main(args):
     with open(output_path, 'w', encoding='utf-8') as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -126,7 +128,8 @@ if __name__ == '__main__':
     parser.add_argument("--sample_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--mode", type=str, choices=['en', 'zh'], default='en')
-    parser.add_argument("--global_seed", type=str, default=42)
+    parser.add_argument("--global_seed", type=int, default=42)
+    parser.add_argument("--prompt_file", type=str, help="Optional benchmark prompt manifest")
     
     args = parser.parse_args()
     main(args)

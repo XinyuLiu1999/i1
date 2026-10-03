@@ -20,7 +20,12 @@ We keep it intact.
 
 ## LongText-Bench
 The core evaluation code is [evaluate_text_reward.py](longtext/evaluate_text_reward.py).<br>
-We keep it intact.
+We add an optional `--prompt_file` manifest for subset evaluation, parse
+`--global_seed` as an integer, bind each distributed worker to `LOCAL_RANK`, and
+destroy its process group after writing results. OCR prompts, model settings,
+and the official `summary_scores.py` scoring formula are unchanged. The
+[text benchmark runner](TEXT_BENCHMARKS.md) validates complete result coverage
+before invoking the official summary script.
 
 ## GenEval
 The core evaluation code is [evaluation/evaluate_images.py](geneval/evaluation/evaluate_images.py).<br>

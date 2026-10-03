@@ -2,6 +2,16 @@
 
 We provide instructions for evaluating images generated with the [torch_inference](../torch_inference) code. The core benchmark evaluation code is taken from the original codebases with only minimal modifications that do not influence the functionality of the code (see [MODIFICATIONS.md](MODIFICATIONS.md)).
 
+## Single-checkpoint LongText / CVTG generation
+
+Use [run_text_benchmarks.sh](TEXT_BENCHMARKS.md) to select any compatible i1
+checkpoint and generate LongText or CVTG images across GPUs. The default stage
+only generates and validates images. LongText additionally supports
+`--stage evaluate` and `--stage all` for multi-GPU OCR and automatic score summaries.
+CVTG currently supports generation only. The runner supports prompt subsets and
+resuming generation; its LongText filenames are already evaluator-ready, so do
+not run the legacy `longtext/process.py` on those outputs.
+
 ## 1. [DPG-Bench](https://github.com/TencentQQGYLab/ELLA/tree/main/dpg_bench)
 
 ### 1.1 Environment setup

@@ -80,7 +80,10 @@ class DenseTextEvalTests(unittest.TestCase):
     def test_gpu_count_pinned_and_evaluate_does_not_detect_cuda(self):
         with patch.object(runner, "run_workers") as workers, patch.object(runner.subprocess, "run") as run, \
                 patch.object(runner, "check_cuda") as cuda:
-            self.execute(self.args("--stage", "generate"))
+            self.execute(self.args())
+            # Default launch only generates and validates images.
+            self.assertEqual(run.call_count, 1)
+            self.assertIn(str(runner.HERE / "validate_images.py"), run.call_args.args[0])
             jobs = workers.call_args.args[0]
             self.assertEqual([gpu for gpu, _ in jobs], ["2", "5", "7"])
             cuda.assert_called_once_with(["2", "5", "7"])
@@ -108,7 +111,7 @@ class DenseTextEvalTests(unittest.TestCase):
     def test_dry_run_does_not_start_workers_or_judge(self):
         with patch.object(runner, "check_cuda", side_effect=AssertionError("CUDA accessed")), \
                 patch.object(runner, "run_workers") as workers, patch.object(runner.subprocess, "run") as run:
-            self.execute(self.args("--dry-run"))
+            self.execute(self.args("--dry-run", "--stage", "all"))
             workers.assert_not_called()
             run.assert_not_called()
 

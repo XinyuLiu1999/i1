@@ -33,7 +33,8 @@ def parse_args(argv=None):
     p.add_argument("--output-root", type=Path, default=os.environ.get("OUTPUT_ROOT"))
     p.add_argument("--gpu-ids", default=os.environ.get("GPU_IDS"),
                    help="CUDA IDs/UUIDs; default: all GPUs visible to this process")
-    p.add_argument("--stage", choices=("all", "prepare", "generate", "evaluate"), default="all")
+    p.add_argument("--stage", choices=("all", "prepare", "generate", "evaluate"), default="generate",
+                   help="Default: generate images only; use all or evaluate to call the judge")
     p.add_argument("--resolution", type=int, choices=(1024, 1536, 2048), default=1024)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--num-steps", type=int, default=250)

@@ -1,29 +1,28 @@
 # DenseText SFT → BizGenEval（单机多 GPU）
 
 在 **另一台有 NVIDIA GPU 的机器** 上运行，默认使用 `i1_sft` conda 环境。
-入口 `run_densetext.sh` 将准备数据、每卡启动一个推理进程、检查图片、调用官方
-Gemini evaluator、检查全部评分并汇总。GPU 并行用于生成；官方评分通过 API 并发。
+入口 `run_densetext.sh` 默认仅准备数据、每卡启动一个推理进程并检查图片，
+无需 Gemini API key。显式使用 `--stage evaluate` 可评分已有图片，
+`--stage all` 可完成生成、官方评分和汇总。GPU 并行用于生成；官方评分通过 API 并发。
 
 ## 环境与路径
 
 按 `torch_train/DENSETEXT_MULTINODE_SFT.md` 配好 `i1_sft` 环境及 T5Gemma、
 FLUX.2 模型缓存。把 i1 和 BizGenEval 放在同一父目录；否则设置
-`BIZGENEVAL_ROOT`。在 `i1_sft` 中补充官方评估器需要的依赖：
+`BIZGENEVAL_ROOT`。生成阶段使用现有 `i1_sft` 环境：
 
 ```bash
-conda run -n i1_sft python -m pip install google-genai pyyaml requests
 export I1=/path/to/i1
 export BIZGENEVAL_ROOT=/path/to/BizGenEval
 export HF_HUB_CACHE=/path/to/model/cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export GEMINI_API_KEY=your-key
 ```
 
 离线开关只控制 Hugging Face 模型加载；Gemini 评分仍需网络和 API 配额。
 API key 也可按 BizGenEval 自身约定配置在 YAML 中。评估器的模型、并发量、重试策略
 使用 `BizGenEval/config/evaluation_config.yaml`；可用 `--evaluation-config` 指定其他配置。
 
-## 完整评估
+## 默认生成图片
 
 ```bash
 export SFT_WORKDIR=/shared/outputs/densetext_sft_1024_run001
@@ -75,7 +74,12 @@ bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" \
 bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" --stage generate
 
 # 之后评分、验证及汇总；沿用相同 checkpoint、数据和采样参数
+conda run -n i1_sft python -m pip install google-genai pyyaml requests
+export GEMINI_API_KEY=your-key
 bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" --stage evaluate
+
+# 显式执行生成、评分和汇总全流程
+bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" --stage all
 
 # 仅准备输入，不探测 CUDA，也不加载 checkpoint
 bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" --stage prepare
@@ -88,8 +92,8 @@ bash "$I1/benchmark_eval/bizgeneval/run_densetext.sh" --stage prepare
 评分不完整时拒绝生成汇总；重复命令可重试不完整评分。改变 judge 配置需要新目录或
 `--force-rerun`（重新评分全部图片）；中断的强制评分须继续带此参数。
 
-输出目录包含 `run.json`、`workers.json`、`judge.json`、`inputs/`、`images/`、
-`logs/worker_N.log`、`eval_results/` 和 `summaries/`。最终报告是
+默认生成阶段输出 `run.json`、`workers.json`、`inputs/`、`images/` 和
+`logs/worker_N.log`。显式评分后增加 `judge.json`、`eval_results/` 和 `summaries/`。最终报告是
 `summaries/summary_by_domain.csv`、`summary_by_dimension.csv`、`summary.json`，
 使用官方 easy/hard/all 评分口径。
 

@@ -418,16 +418,16 @@ set `BIZGENEVAL_ROOT` if it lives elsewhere.
 export BIZGENEVAL_ROOT=/path/to/BizGenEval
 export SFT_CHECKPOINT=$SFT_WORKDIR/checkpoint.pt-000010000
 export OUTPUT_ROOT=$SFT_WORKDIR/bizgeneval/step10000_1024
-export GEMINI_API_KEY=your-key
-conda run -n i1_sft python -m pip install google-genai pyyaml requests
 bash $I1/../benchmark_eval/bizgeneval/run_densetext.sh
 # Optional: --gpu-ids 0,1,2,3 (default: all visible local GPUs)
 # Mixed-resolution checkpoint: --resolution 2048 --output-root /shared/eval/step10000_2048
 ```
 
 GPU parallelism applies to image generation; the official Gemini judge uses API
-concurrency. Use `--stage generate` without an API key, then `--stage evaluate`
-with the same settings to score later. Use a separate output directory for a
+concurrency. The default stage only generates and validates images, without an
+API key. To score later, install `google-genai pyyaml requests` in `i1_sft`, set
+`GEMINI_API_KEY`, and use `--stage evaluate` with the same settings. Use
+`--stage all` explicitly for generation, scoring, and summaries. Use a separate output directory for a
 smoke test (`--limit 4 --num-steps 2`) or changed sampling settings. See
 [`benchmark_eval/bizgeneval/DENSETEXT.md`](../benchmark_eval/bizgeneval/DENSETEXT.md)
 for dependencies, resume rules, token limits, and reports.

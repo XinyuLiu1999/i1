@@ -4,6 +4,8 @@ For checkpoints produced by `torch_train/DENSETEXT_MULTINODE_SFT.md`, use
 [DenseText single-node multi-GPU evaluation](DENSETEXT.md). The new
 `run_densetext.sh` entry point defaults to the `i1_sft` conda environment,
 accepts any saved SFT checkpoint, and supports 1024/1536/2048 output tiers.
+By default it only generates and validates images; use `--stage evaluate` to
+score existing images or `--stage all` to generate, score, and summarize.
 Run it on the CUDA machine where the checkpoint and model caches are available.
 
 ## Legacy: starting checkpoint vs. SFT step 6262

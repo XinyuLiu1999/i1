@@ -6,9 +6,10 @@ We provide instructions for evaluating images generated with the [torch_inferenc
 
 Use [run_text_benchmarks.sh](TEXT_BENCHMARKS.md) to select any compatible i1
 checkpoint and generate LongText or CVTG images across GPUs. The default stage
-only generates and validates images. LongText additionally supports
-`--stage evaluate` and `--stage all` for multi-GPU OCR and automatic score summaries.
-CVTG currently supports generation only. The runner supports prompt subsets and
+only generates and validates images. LongText and CVTG additionally support
+`--stage evaluate` and `--stage all` for multi-GPU scoring and automatic summaries.
+For CVTG model downloads and evaluation, see [CVTG_EVALUATION.md](CVTG_EVALUATION.md).
+The runner supports prompt subsets and
 resuming generation; its LongText filenames are already evaluator-ready, so do
 not run the legacy `longtext/process.py` on those outputs.
 
@@ -152,13 +153,18 @@ bash install_paddle_deps.sh
 ```
 
 ### 5.2 Run evaluation
+
+For complete model pre-download commands and multi-GPU evaluation through the shared
+benchmark runner, see [CVTG_EVALUATION.md](CVTG_EVALUATION.md). The commands below
+are for legacy generated images; **do not run `process.py` on shared-runner outputs**.
+
 ```bash
 CVTG_IMAGES=/path/to/generated/images
 
 # Reorganize the generated image folder into the format expected by the evaluation code
 python process.py --root $CVTG_IMAGES
 
-python unified_metrics_eval.py --benchmark_dir prompts --result_dir $CVTG_IMAGES --output_file $CVTG_IMAGES/results.json --cache_dir /path/to/huggingface/cache --no_hf_mirror
+python unified_metrics_eval.py --benchmark_dir prompts --result_dir "$CVTG_IMAGES" --output_file "$CVTG_IMAGES/results.json" --cache_dir /path/to/huggingface/cache --gpu-ids 0,1,2,3 --clip-batch-size 16 --no_hf_mirror
 ```
 
 ## 6. [BizGenEval](https://github.com/microsoft/BizGenEval)

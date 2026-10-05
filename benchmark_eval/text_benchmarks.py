@@ -1,4 +1,4 @@
-"""Single-checkpoint, multi-GPU LongText/CVTG generation and optional LongText scoring."""
+"""Single-checkpoint, multi-GPU LongText/CVTG generation and optional scoring."""
 from __future__ import annotations
 
 import argparse
@@ -31,8 +31,12 @@ def parse_args(argv=None):
     p.add_argument("--stage", choices=("prepare", "generate", "evaluate", "all"), default="generate")
     p.add_argument("--output-root", type=Path, default=os.environ.get("OUTPUT_ROOT"))
     p.add_argument("--gpu-ids", default=os.environ.get("GPU_IDS"))
-    p.add_argument("--evaluation-python", default=os.environ.get("LONGTEXT_PYTHON", sys.executable),
-                   help="Python with LongText scoring dependencies (default: generation Python)")
+    p.add_argument("--evaluation-python", help="Python with benchmark scoring dependencies")
+    p.add_argument("--evaluation-cache-dir", default=os.environ.get("CVTG_CACHE_DIR", str(Path.home() / ".cache/cvtg")),
+                   help="CVTG model cache, shared by all evaluation workers")
+    p.add_argument("--clip-batch-size", type=int, default=16, help="CVTG CLIP images per batch per GPU")
+    p.add_argument("--use-hf-mirror", dest="use_hf_mirror", action="store_true", help="Use hf-mirror.com for CVTG")
+    p.add_argument("--no-hf-mirror", dest="use_hf_mirror", action="store_false")
     p.add_argument("--prompt-variant", choices=("original", "simple_rewrite", "complex_rewrite"), default="original")
     p.add_argument("--limit", type=int, default=0, help="First N prompts; 0 uses the full benchmark")
     p.add_argument("--resolution", type=int, choices=(256, 512, 1024, 1536, 2048), default=1024)
@@ -49,11 +53,12 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.benchmark == "cvtg":
         args.benchmark = "cvtg-2k"
-    if args.benchmark == "cvtg-2k" and args.stage in ("evaluate", "all"):
-        p.error("CVTG only supports --stage prepare or generate; scoring is not implemented")
+    if args.evaluation_python is None:
+        variable = "CVTG_PYTHON" if args.benchmark == "cvtg-2k" else "LONGTEXT_PYTHON"
+        args.evaluation_python = os.environ.get(variable, sys.executable)
     if args.checkpoint is None:
         p.error("Set --checkpoint, SFT_CHECKPOINT, or SFT_WORKDIR")
-    for key in ("num_steps", "text_num_tokens", "diffusion_batch_size", "vae_batch_size"):
+    for key in ("num_steps", "text_num_tokens", "diffusion_batch_size", "vae_batch_size", "clip_batch_size"):
         if getattr(args, key) is not None and getattr(args, key) <= 0:
             p.error(f"--{key.replace('_', '-')} must be positive")
     if args.limit < 0 or args.seed < 0:
@@ -230,6 +235,9 @@ def merge_results(directory, samples, image_dir, workers):
 
 
 def evaluate(args, samples):
+    if args.benchmark == "cvtg-2k":
+        from cvtg_evaluation import evaluate_from_runner
+        return evaluate_from_runner(args)
     out = args.output_root
     ids = gpu_ids(args.gpu_ids, args.evaluation_python)[:len(samples)]
     base = [args.evaluation_python, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",

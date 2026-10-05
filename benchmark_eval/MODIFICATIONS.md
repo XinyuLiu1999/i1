@@ -47,8 +47,19 @@ We modify the metadata loading code so that the metadata files do not have to be
 ```
 
 ## CVTG-2K
-The core evaluation code is [unified_metrics_eval.py](cvtg-2k/unified_metrics_eval.py).<br>
-We keep it intact.
+The metric implementations are in [unified_metrics_eval.py](cvtg-2k/unified_metrics_eval.py).
+The [CVTG coordinator](cvtg_evaluation.py) shards images over isolated GPU workers,
+accepts both legacy folders and the shared runner's sample manifest, and aggregates
+validated per-image results. CLIPScore now uses bounded batches (default 16).
+OCR matching / normalized edit similarity, CLIPScore's text prefix and 2.5 scale,
+VQA model and question defaults, and aesthetic prediction formulas are preserved;
+batch-size changes may cause floating-point rounding differences. Evaluation always
+uses official original prompts, including when generation uses rewritten prompts.
+Missing models, incomplete coverage, non-finite scores and inference failures now
+abort rather than silently producing zeros. CPU/device selection and model-cache
+paths are explicit for every model. The companion downloader prefetches VQA weights,
+its tokenizer/vision tower, both CLIP assets and OCR models into that shared cache.
+See [CVTG_EVALUATION.md](CVTG_EVALUATION.md) for commands and output contracts.
 
 ## BizGenEval
 The core evaluator remains in the sibling `BizGenEval` checkout and is invoked

@@ -1,8 +1,8 @@
 # 自选 checkpoint → LongText / CVTG 多 GPU 生成与评测
 
 统一入口：`benchmark_eval/run_text_benchmarks.sh`。单次选择一个 checkpoint 和一个
-benchmark，默认 **只生成并验证图片**。LongText 支持显式评分及汇总；CVTG 只实现生成，
-`--stage evaluate` 和 `--stage all` 会直接报错。
+benchmark，默认 **只生成并验证图片**。LongText 和 CVTG 均支持
+`--stage evaluate` 单独评分和 `--stage all` 生成后评分。
 
 在有 NVIDIA GPU 和模型缓存的机器上运行。默认使用 `i1_sft` conda 环境；
 设置 `PYTHON_BIN=/path/to/env/bin/python` 可改用指定解释器。生成依赖见
@@ -36,7 +36,7 @@ checkpoint 优先级：`--checkpoint` > `SFT_CHECKPOINT` > `SFT_WORKDIR/checkpoi
 默认：原始 prompt、不在线重写、1024×1024、250 步、CFG 12、CFG rescale 1、
 timestep shift 0.3、seed 42、diffusion/VAE batch 均为 1。支持
 `--prompt-variant simple_rewrite|complex_rewrite` 使用仓库内预先改写的 prompt。
-LongText 评分始终使用原始 benchmark 的目标文字。
+LongText 和 CVTG 评分始终使用原始 benchmark 的 prompt / 目标文字。
 
 默认保留 checkpoint 原生文本上下文，超长文本截断。可设置
 `--caption-overflow error` 在超长时报错，或用 `--text-num-tokens 1024` 等显式扩展上下文；
@@ -87,9 +87,27 @@ eval_results/scores.txt        官方 Text Score
 eval_results/summary.json      汇总分数、图片数、prompt 数、checkpoint
 ```
 
-`eval_results/` 仅在 LongText 显式评分成功后产生。Text Score 是所有图片的
-匹配词数之和除以目标词数之和，范围 0–1。CVTG 保留 `00000.png` 等平铺编号，
-其 `inputs/samples.jsonl` 记录对应的官方 category/ID；本入口不整理 CVTG 评分目录或执行评分。
+以上为 LongText 评分输出。Text Score 是所有图片的匹配词数之和除以目标词数之和，范围 0–1。
+
+## CVTG 多 GPU 评分
+
+完整环境准备、模型预下载和旧目录兼容命令见 [CVTG_EVALUATION.md](CVTG_EVALUATION.md)。
+
+```bash
+bash "$I1/benchmark_eval/run_text_benchmarks.sh" \
+  --benchmark cvtg --stage evaluate \
+  --output-root /shared/eval/step10000_cvtg \
+  --evaluation-python /path/to/envs/textcrafter_eval/bin/python \
+  --evaluation-cache-dir /shared/cache/cvtg \
+  --clip-batch-size 16 --no-hf-mirror
+```
+
+`--stage all` 则先生成再评分。评分环境也可用 `CVTG_PYTHON` 指定，缓存可用 `CVTG_CACHE_DIR` 指定。
+CVTG 图片保留平铺命名，通过 `inputs/samples.jsonl` 映射到官方 ID，支持子集和 rewritten prompt。
+**不要运行 `cvtg-2k/process.py`**，否则会移动图片，破坏入口清单。
+每卡独立加载完整评分模型，每卡仍需足够显存容纳 XXL；默认 CLIP batch 为 16。
+输出为 `eval_results/results.json`、`results.jsonl`、`results_summary.json`，
+逐卡日志位于 `eval_results/logs/worker_N.log`。验证全部分片后才发布评分结果；失败保留旧分数。
 
 ## 小样本检查、续跑与参数保护
 
@@ -115,4 +133,5 @@ CPU 回归测试（需要 Pillow，不加载模型、不访问网络）：
 
 ```bash
 python -m unittest discover -s "$I1/benchmark_eval" -p 'test_text_benchmarks.py' -v
+python -m unittest discover -s "$I1/benchmark_eval" -p 'test_cvtg_evaluation.py' -v
 ```

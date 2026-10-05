@@ -41,14 +41,15 @@ class TextBenchmarksTests(unittest.TestCase):
         for row in runner.prepare_data(args):
             Image.new("RGB", (args.resolution, args.resolution)).save(args.output_root / "images" / row["name"])
 
-    def test_defaults_and_cvtg_scoring_rejected_before_output(self):
+    def test_defaults_and_cvtg_scoring_supported(self):
         args = self.args()
         self.assertEqual(args.stage, "generate")
         self.assertEqual(args.prompt_variant, "original")
         self.assertIsNone(args.text_num_tokens)
         for stage in ("evaluate", "all"):
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                self.args("--benchmark", "cvtg", "--stage", stage)
+            cvtg = self.args("--benchmark", "cvtg", "--stage", stage)
+            self.assertEqual(cvtg.benchmark, "cvtg-2k")
+            self.assertEqual(cvtg.stage, stage)
         self.assertFalse(self.output.exists())
 
     def test_full_datasets_and_all_prompt_variants(self):

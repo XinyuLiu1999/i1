@@ -40,6 +40,8 @@ def parse_args(argv=None):
     p.add_argument("--num-steps", type=int, default=250)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--text-num-tokens", type=int, default=1024)
+    p.add_argument("--native-text-context", dest="text_num_tokens", action="store_const", const=None,
+                   help="Use checkpoint-native context without overriding text_num_tokens")
     p.add_argument("--caption-overflow", choices=("truncate", "error"), default="truncate")
     p.add_argument("--cfg-scale", type=float, default=12.0)
     p.add_argument("--cfg-rescale", type=float, default=1.0)
@@ -53,7 +55,7 @@ def parse_args(argv=None):
     if args.checkpoint is None:
         p.error("Set --checkpoint, SFT_CHECKPOINT, or SFT_WORKDIR")
     for key in ("num_steps", "text_num_tokens", "diffusion_batch_size", "vae_batch_size"):
-        if getattr(args, key) <= 0:
+        if getattr(args, key) is not None and getattr(args, key) <= 0:
             p.error(f"--{key.replace('_', '-')} must be positive")
     if args.limit < 0 or args.seed < 0:
         p.error("--limit and --seed must be non-negative")
@@ -144,6 +146,7 @@ def generation_command(args, start, end, worker):
             "--outdir", str(out / "images")] + [
                 value for key in ("num_steps", "text_num_tokens", "caption_overflow", "cfg_scale",
                                   "cfg_rescale", "inference_timestep_shift", "diffusion_batch_size", "vae_batch_size")
+                if getattr(args, key) is not None
                 for value in ("--" + key.replace("_", "-"), str(getattr(args, key)))]
 
 
